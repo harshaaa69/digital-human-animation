@@ -8,6 +8,7 @@ from backend.audio_utils import (
     convert_to_standard_wav,
     get_audio_metadata,
 )
+from backend.speech_features import extract_speech_features
 
 app = FastAPI(
     title="Digital Human Animation API",
@@ -23,11 +24,14 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 PROCESSED_DIR = BASE_DIR / "data" / "processed"
+FEATURE_DIR = BASE_DIR / "data" / "features"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+FEATURE_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_AUDIO_TYPES = {
     "audio/mpeg",
@@ -114,4 +118,50 @@ async def upload_audio(file: UploadFile = File(...)):
         "size": len(content),
         "content_type": file.content_type,
         "metadata": metadata,
+    }
+
+
+@app.post("/extract-features/{processed_name}")
+def extract_features(processed_name: str):
+    safe_name = Path(processed_name).name
+
+    if safe_name != processed_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid processed filename"
+        )
+
+    if not safe_name.lower().endswith(".wav"):
+        raise HTTPException(
+            status_code=400,
+            detail="Processed file must be a WAV file"
+        )
+
+    processed_path = PROCESSED_DIR / safe_name
+
+    if not processed_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Processed audio file not found"
+        )
+
+    feature_name = f"{processed_path.stem}.npy"
+    feature_path = FEATURE_DIR / feature_name
+
+    try:
+        result = extract_speech_features(
+            processed_path,
+            feature_path,
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Speech feature extraction failed: {error}"
+        )
+
+    return {
+        "message": "Speech features extracted successfully",
+        "processed_name": safe_name,
+        **result,
     }

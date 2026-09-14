@@ -17,6 +17,7 @@ build/
 
 data/uploads/
 data/processed/
+data/features/
 outputs/
 
 models/checkpoints/

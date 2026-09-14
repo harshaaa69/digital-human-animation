@@ -1,12 +1,28 @@
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
 .env
+.env.*
+!.env.example
+!**/.env.example
+
 .DS_Store
 
 node_modules/
 dist/
+build/
 
-outputs/
 data/uploads/
+data/processed/
+outputs/
+
 models/checkpoints/
+models/*.pth
+models/*.pt
+models/*.ckpt
+
+.vscode/
+.idea/

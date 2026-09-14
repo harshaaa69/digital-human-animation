@@ -6,8 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.audio_utils import (
     convert_to_standard_wav,
+    create_test_segment,
     get_audio_metadata,
 )
+from backend.motion_generator import generate_motion
 from backend.speech_features import extract_speech_features
 
 app = FastAPI(
@@ -28,10 +30,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 PROCESSED_DIR = BASE_DIR / "data" / "processed"
 FEATURE_DIR = BASE_DIR / "data" / "features"
+TEST_SEGMENT_DIR = BASE_DIR / "data" / "test_segments"
+MOTION_DIR = BASE_DIR / "data" / "motion"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 FEATURE_DIR.mkdir(parents=True, exist_ok=True)
+TEST_SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
+MOTION_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_AUDIO_TYPES = {
     "audio/mpeg",
@@ -121,6 +127,51 @@ async def upload_audio(file: UploadFile = File(...)):
     }
 
 
+@app.post("/create-test-segment/{processed_name}")
+def create_short_test_segment(processed_name: str):
+    safe_name = Path(processed_name).name
+
+    if safe_name != processed_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid processed filename"
+        )
+
+    processed_path = PROCESSED_DIR / safe_name
+
+    if not processed_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Processed audio file not found"
+        )
+
+    segment_name = f"{processed_path.stem}_15s.wav"
+    segment_path = TEST_SEGMENT_DIR / segment_name
+
+    try:
+        create_test_segment(
+            processed_path,
+            segment_path,
+            duration_seconds=15,
+        )
+
+        metadata = get_audio_metadata(
+            segment_path
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Test segment creation failed: {error}"
+        )
+
+    return {
+        "message": "Test segment created successfully",
+        "segment_name": segment_name,
+        "metadata": metadata,
+    }
+
+
 @app.post("/extract-features/{processed_name}")
 def extract_features(processed_name: str):
     safe_name = Path(processed_name).name
@@ -163,5 +214,45 @@ def extract_features(processed_name: str):
     return {
         "message": "Speech features extracted successfully",
         "processed_name": safe_name,
+        **result,
+    }
+
+
+@app.post("/generate-motion/{segment_name}")
+def generate_motion_data(segment_name: str):
+    safe_name = Path(segment_name).name
+
+    if safe_name != segment_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid segment filename"
+        )
+
+    segment_path = TEST_SEGMENT_DIR / safe_name
+
+    if not segment_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Test segment not found"
+        )
+
+    motion_name = f"{segment_path.stem}_motion.npy"
+    motion_path = MOTION_DIR / motion_name
+
+    try:
+        result = generate_motion(
+            segment_path,
+            motion_path,
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Motion generation failed: {error}"
+        )
+
+    return {
+        "message": "Motion generated successfully",
+        "segment_name": safe_name,
         **result,
     }

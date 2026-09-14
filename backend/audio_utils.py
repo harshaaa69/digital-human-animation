@@ -42,3 +42,26 @@ def get_audio_metadata(audio_path: Path) -> dict:
         "format": info.format,
         "subtype": info.subtype,
     }
+
+
+def create_test_segment(
+    input_path: Path,
+    output_path: Path,
+    duration_seconds: int = 15,
+) -> Path:
+    audio = AudioSegment.from_file(input_path)
+
+    duration_ms = duration_seconds * 1000
+    segment = audio[:duration_ms]
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    segment.export(
+        output_path,
+        format="wav"
+    )
+
+    return output_path

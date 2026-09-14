@@ -18,6 +18,8 @@ build/
 data/uploads/
 data/processed/
 data/features/
+data/test_segments/
+data/motion/
 outputs/
 
 models/checkpoints/

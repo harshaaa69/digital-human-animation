@@ -4,7 +4,10 @@ from uuid import uuid4
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.audio_utils import convert_to_standard_wav
+from backend.audio_utils import (
+    convert_to_standard_wav,
+    get_audio_metadata,
+)
 
 app = FastAPI(
     title="Digital Human Animation API",
@@ -86,9 +89,17 @@ async def upload_audio(file: UploadFile = File(...)):
             uploaded_path,
             processed_path
         )
+
+        metadata = get_audio_metadata(
+            processed_path
+        )
+
     except Exception:
         if uploaded_path.exists():
             uploaded_path.unlink()
+
+        if processed_path.exists():
+            processed_path.unlink()
 
         raise HTTPException(
             status_code=500,
@@ -102,6 +113,5 @@ async def upload_audio(file: UploadFile = File(...)):
         "processed_name": processed_name,
         "size": len(content),
         "content_type": file.content_type,
-        "sample_rate": 16000,
-        "channels": 1,
+        "metadata": metadata,
     }

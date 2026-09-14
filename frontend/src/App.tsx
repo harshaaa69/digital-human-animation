@@ -6,18 +6,30 @@ type HealthResponse = {
   status: string;
 };
 
+type AudioMetadata = {
+  duration: number;
+  sample_rate: number;
+  channels: number;
+  frames: number;
+  format: string;
+  subtype: string;
+};
+
 type UploadResponse = {
   message: string;
   original_name: string;
   stored_name: string;
+  processed_name: string;
   size: number;
   content_type: string;
+  metadata: AudioMetadata;
 };
 
 function App() {
   const [backendStatus, setBackendStatus] = useState("Checking backend...");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadMessage, setUploadMessage] = useState("");
+  const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [isUploading, setIsUploading] = useState(false);
 
   useEffect(() => {
@@ -52,6 +64,7 @@ function App() {
 
     setSelectedFile(file);
     setUploadMessage("");
+    setUploadResult(null);
   };
 
   const handleUpload = async () => {
@@ -65,6 +78,7 @@ function App() {
 
     setIsUploading(true);
     setUploadMessage("");
+    setUploadResult(null);
 
     try {
       const response = await fetch(
@@ -84,6 +98,7 @@ function App() {
 
       const result: UploadResponse = data;
 
+      setUploadResult(result);
       setUploadMessage(
         `${result.original_name} uploaded successfully`
       );
@@ -138,6 +153,30 @@ function App() {
 
           {uploadMessage && (
             <p className="upload-message">{uploadMessage}</p>
+          )}
+
+          {uploadResult && (
+            <div className="metadata">
+              <div>
+                <span>Duration</span>
+                <strong>{uploadResult.metadata.duration} sec</strong>
+              </div>
+
+              <div>
+                <span>Sample Rate</span>
+                <strong>{uploadResult.metadata.sample_rate} Hz</strong>
+              </div>
+
+              <div>
+                <span>Channels</span>
+                <strong>{uploadResult.metadata.channels}</strong>
+              </div>
+
+              <div>
+                <span>Format</span>
+                <strong>{uploadResult.metadata.format}</strong>
+              </div>
+            </div>
           )}
         </div>
       </section>

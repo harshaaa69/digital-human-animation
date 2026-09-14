@@ -107,3 +107,25 @@ h1 {
   margin-bottom: 0 !important;
   color: white !important;
 }
+
+.metadata {
+  margin-top: 20px;
+  display: grid;
+  gap: 10px;
+}
+
+.metadata div {
+  display: flex;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #202024;
+}
+
+.metadata span {
+  color: #9a9aa3;
+}
+
+.metadata strong {
+  color: white;
+}

@@ -1,8 +1,10 @@
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from backend.audio_utils import (
     convert_to_standard_wav,
@@ -49,6 +51,16 @@ ALLOWED_AUDIO_TYPES = {
 }
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
+
+MOTION_PARAMETERS = [
+    "mouth_open",
+    "mouth_width",
+    "brow_raise",
+    "head_yaw",
+    "head_pitch",
+    "head_roll",
+    "gesture_intensity",
+]
 
 
 @app.get("/")
@@ -256,3 +268,63 @@ def generate_motion_data(segment_name: str):
         "segment_name": safe_name,
         **result,
     }
+
+
+@app.get("/motion-data/{motion_name}")
+def get_motion_data(motion_name: str):
+    safe_name = Path(motion_name).name
+
+    if safe_name != motion_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid motion filename"
+        )
+
+    motion_path = MOTION_DIR / safe_name
+
+    if not motion_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Motion file not found"
+        )
+
+    try:
+        motion = np.load(motion_path)
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to load motion data: {error}"
+        )
+
+    return {
+        "motion_name": safe_name,
+        "fps": 30,
+        "frames": motion.shape[0],
+        "parameters": MOTION_PARAMETERS,
+        "data": motion.tolist(),
+    }
+
+
+@app.get("/test-audio/{segment_name}")
+def get_test_audio(segment_name: str):
+    safe_name = Path(segment_name).name
+
+    if safe_name != segment_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid segment filename"
+        )
+
+    segment_path = TEST_SEGMENT_DIR / safe_name
+
+    if not segment_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Test audio not found"
+        )
+
+    return FileResponse(
+        segment_path,
+        media_type="audio/wav",
+        filename=safe_name,
+    )

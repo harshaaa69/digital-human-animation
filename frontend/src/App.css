@@ -30,7 +30,6 @@
   border-radius: 12px;
   font-size: 14px;
   font-weight: 800;
-  letter-spacing: -0.5px;
 }
 
 .brand-text {
@@ -61,6 +60,7 @@
 .viewport-dot {
   width: 7px;
   height: 7px;
+  flex-shrink: 0;
   border-radius: 50%;
   background: #a9bda6;
 }
@@ -171,56 +171,153 @@
   pointer-events: none;
 }
 
-.playback-panel {
-  padding: 26px 28px 28px;
+.timeline-section {
+  padding: 27px 28px 30px;
 }
 
-.time-row {
+.timeline-heading {
   display: flex;
+  align-items: end;
   justify-content: space-between;
-  color: #b3b7c0;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.timeline-heading h3 {
+  margin: 8px 0 0;
+  font-size: 18px;
+  letter-spacing: -0.4px;
+  font-weight: 600;
+}
+
+.timeline-duration {
+  color: #bfc4cd;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  margin-bottom: 12px;
+  white-space: nowrap;
 }
 
-.progress-track,
-.parameter-track {
-  width: 100%;
-  background: #30333b;
+.waveform-container {
+  position: relative;
+  height: 112px;
+  border: 1px solid #333741;
+  border-radius: 12px;
+  background: #1b1e25;
   overflow: hidden;
 }
 
-.progress-track {
-  height: 5px;
-  border-radius: 10px;
-}
-
-.progress-fill {
-  height: 100%;
-  background: #e4e6ea;
-  border-radius: inherit;
-  transition: width 0.05s linear;
-}
-
-.playback-buttons {
+.waveform-bars {
+  position: absolute;
+  inset: 13px 16px;
   display: flex;
-  gap: 12px;
-  margin-top: 26px;
+  justify-content: space-between;
+  align-items: center;
+  gap: 2px;
+  pointer-events: none;
+}
+
+.waveform-bar {
+  flex: 1;
+  min-width: 1px;
+  max-width: 6px;
+  border-radius: 3px;
+  background: #515762;
+  transition: background 0.08s linear;
+}
+
+.waveform-bar.played {
+  background: #d7dce4;
+}
+
+.waveform-placeholder {
+  color: #777d8a;
+  font-size: 12px;
+  margin: auto;
+}
+
+.timeline-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #f3f4f6;
+  transform: translateX(-1px);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.timeline-playhead::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -5px;
+  width: 12px;
+  height: 10px;
+  background: #f3f4f6;
+  border-radius: 0 0 3px 3px;
+}
+
+.timeline-range {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: crosshair;
+  z-index: 3;
+}
+
+.timeline-range:disabled {
+  cursor: not-allowed;
+}
+
+.waveform-container:focus-within {
+  outline: 2px solid #bfc5d0;
+  outline-offset: 3px;
+}
+
+.timeline-markers {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 13px;
+  color: #747b88;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.transport-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  margin-top: 30px;
+}
+
+.transport-buttons {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .primary-button,
-.secondary-button {
+.secondary-button,
+.icon-button {
   border-radius: 10px;
-  padding: 13px 20px;
   font-size: 13px;
   font-weight: 650;
   cursor: pointer;
-  transition: background 0.2s, transform 0.2s;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    transform 0.2s ease;
 }
 
 .primary-button {
-  flex: 1;
+  min-width: 110px;
+  padding: 13px 22px;
   border: 1px solid #f1f1f3;
   color: #111217;
   background: #f1f1f3;
@@ -230,19 +327,56 @@
   background: #d4d8df;
 }
 
-.secondary-button {
+.secondary-button,
+.icon-button {
   border: 1px solid #40434e;
   color: #e3e4e8;
   background: #22252c;
 }
 
-.secondary-button:hover:not(:disabled) {
+.secondary-button {
+  padding: 13px 20px;
+}
+
+.icon-button {
+  min-width: 49px;
+  height: 44px;
+  padding: 0 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.secondary-button:hover:not(:disabled),
+.icon-button:hover:not(:disabled) {
   background: #333741;
 }
 
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+button:focus-visible {
+  outline: 2px solid #d7dce4;
+  outline-offset: 3px;
+}
+
+.frame-indicator {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.frame-indicator span {
+  color: #858c98;
+  font-size: 11px;
+}
+
+.frame-indicator strong {
+  color: #f1f2f5;
+  font-size: 21px;
+  letter-spacing: -0.8px;
 }
 
 .details-panel {
@@ -305,13 +439,16 @@ button:disabled {
 
 .parameter-top strong {
   color: #edeef1;
-  font-variant-numeric: tabular-nums;
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .parameter-track {
+  width: 100%;
   height: 4px;
   border-radius: 10px;
+  background: #30333b;
+  overflow: hidden;
 }
 
 .parameter-fill {
@@ -321,10 +458,15 @@ button:disabled {
   transition: width 0.08s linear;
 }
 
-.state-message {
-  color: #aeb4c0;
+.inspector-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 32px;
+  padding-top: 22px;
+  border-top: 1px solid #30333c;
+  color: #9fa5af;
   font-size: 12px;
-  margin-top: 20px;
 }
 
 .error-message {
@@ -341,7 +483,7 @@ button:disabled {
   margin-top: 24px;
 }
 
-@media (max-width: 1000px) {
+@media (max-width: 1100px) {
   .studio-grid {
     grid-template-columns: 1fr;
   }
@@ -353,12 +495,14 @@ button:disabled {
   }
 
   .details-header,
-  .motion-heading {
+  .motion-heading,
+  .inspector-footer,
+  .error-message {
     grid-column: 1 / -1;
   }
 }
 
-@media (max-width: 600px) {
+@media (max-width: 700px) {
   .studio-header {
     padding: 18px 20px;
   }
@@ -383,12 +527,53 @@ button:disabled {
     padding: 22px;
   }
 
-  .playback-panel {
-    padding: 22px;
+  .timeline-section {
+    padding: 24px 18px;
+  }
+
+  .timeline-heading {
+    align-items: start;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .waveform-container {
+    height: 96px;
+  }
+
+  .timeline-markers {
+    font-size: 9px;
+  }
+
+  .transport-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .transport-buttons {
+    justify-content: space-between;
+  }
+
+  .primary-button {
+    flex: 1;
+  }
+
+  .frame-indicator {
+    align-self: flex-end;
   }
 
   .details-panel {
     display: block;
     padding: 24px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .primary-button,
+  .secondary-button,
+  .icon-button,
+  .waveform-bar,
+  .parameter-fill {
+    transition: none;
   }
 }

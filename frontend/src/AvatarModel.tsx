@@ -1,27 +1,34 @@
-import { useEffect, useRef } from "react";
-import { useFrame } from "@react-three/fiber";
-import { useGLTF } from "@react-three/drei";
-import type {
-  Group,
-  Mesh,
-  Object3D,
-} from "three";
+
+import { useMemo, useEffect } from "react";
+import { useFrame, useLoader, useThree } from "@react-three/fiber";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
+import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
+import type { Mesh, Object3D } from "three";
 
 type AvatarModelProps = {
   frame: number[];
 };
 
 function AvatarModel({ frame }: AvatarModelProps) {
-  const groupRef = useRef<Group>(null);
+  const gl = useThree((state) => state.gl);
 
-  const { scene } = useGLTF("/models/avatar.glb");
+  const ktx2Loader = useMemo(() => {
+    return new KTX2Loader()
+      .setTranscoderPath("/basis/")
+      .detectSupport(gl);
+  }, [gl]);
 
-  const mouthOpen = frame[0] ?? 0;
-  const mouthWidth = frame[1] ?? 0;
-  const browRaise = frame[2] ?? 0;
-  const headYaw = frame[3] ?? 0;
-  const headPitch = frame[4] ?? 0;
-  const headRoll = frame[5] ?? 0;
+  const gltf = useLoader(
+    GLTFLoader,
+    "/models/avatar.glb",
+    (loader) => {
+      loader.setKTX2Loader(ktx2Loader);
+      loader.setMeshoptDecoder(MeshoptDecoder);
+    }
+  );
+
+  const scene = gltf.scene;
 
   useEffect(() => {
     scene.traverse((object: Object3D) => {
@@ -32,7 +39,8 @@ function AvatarModel({ frame }: AvatarModelProps) {
         mesh.morphTargetInfluences
       ) {
         console.log(
-          `Morph targets for ${mesh.name}`,
+          "Avatar mesh:",
+          mesh.name,
           mesh.morphTargetDictionary
         );
       }
@@ -40,11 +48,18 @@ function AvatarModel({ frame }: AvatarModelProps) {
   }, [scene]);
 
   useFrame(() => {
-    if (groupRef.current) {
-      groupRef.current.rotation.y = headYaw;
-      groupRef.current.rotation.x = headPitch;
-      groupRef.current.rotation.z = headRoll;
-    }
+    const mouthOpen = frame[0] ?? 0;
+    const mouthWidth = frame[1] ?? 0;
+    const browRaise = frame[2] ?? 0;
+    const headYaw = frame[3] ?? 0;
+    const headPitch = frame[4] ?? 0;
+    const headRoll = frame[5] ?? 0;
+
+    scene.rotation.set(
+      headPitch * 0.5,
+      headYaw * 0.5,
+      headRoll * 0.5
+    );
 
     scene.traverse((object: Object3D) => {
       const mesh = object as Mesh;
@@ -63,58 +78,51 @@ function AvatarModel({ frame }: AvatarModelProps) {
         names: string[],
         value: number
       ) => {
-        for (const name of names) {
-          const index = dictionary[name];
+        Object.entries(dictionary).forEach(
+          ([name, index]) => {
+            const normalizedName = name
+              .split(".")
+              .pop()
+              ?.toLowerCase();
 
-          if (index !== undefined) {
-            influences[index] = value;
+            if (
+              normalizedName &&
+              names.some(
+                (target) =>
+                  normalizedName === target.toLowerCase()
+              )
+            ) {
+              influences[index] = Math.max(
+                0,
+                Math.min(1, value)
+              );
+            }
           }
-        }
+        );
       };
 
       setMorph(
-        [
-          "jawOpen",
-          "Jaw_Open",
-          "mouthOpen",
-          "Mouth_Open",
-          "viseme_aa",
-        ],
+        ["jawOpen", "mouthOpen"],
         mouthOpen
       );
 
       setMorph(
-        [
-          "mouthSmileLeft",
-          "mouthSmileRight",
-          "Mouth_Smile",
-        ],
-        mouthWidth * 0.35
+        ["mouthStretchLeft", "mouthStretchRight"],
+        mouthWidth * 0.4
       );
 
       setMorph(
         [
           "browInnerUp",
           "browOuterUpLeft",
-          "browOuterUpRight",
-          "Brow_Raise",
+          "browOuterUpRight"
         ],
-        browRaise
+        browRaise * 0.6
       );
     });
   });
 
-  return (
-    <group
-      ref={groupRef}
-      position={[0, -2.6, 0]}
-      scale={2}
-    >
-      <primitive object={scene} />
-    </group>
-  );
+  return <primitive object={scene} />;
 }
-
-useGLTF.preload("/models/avatar.glb");
 
 export default AvatarModel;

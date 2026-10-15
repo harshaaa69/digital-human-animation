@@ -1,0 +1,197 @@
+
+.export-section {
+  margin: 0 28px 28px;
+  padding: 27px;
+  border: 1px solid #363a44;
+  border-radius: 14px;
+  background: #1b1e25;
+}
+
+.export-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.export-heading h3 {
+  margin: 9px 0 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.6px;
+}
+
+.export-heading p {
+  max-width: 430px;
+  margin: 10px 0 0;
+  color: #969da9;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.export-format {
+  padding: 8px 12px;
+  border: 1px solid #4c505b;
+  border-radius: 7px;
+  color: #e0e3e8;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.export-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 25px;
+}
+
+.export-button,
+.download-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 46px;
+  padding: 13px 22px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 650;
+  text-decoration: none;
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease;
+}
+
+.export-button {
+  border: 1px solid #e7e9ed;
+  background: #e7e9ed;
+  color: #14161b;
+}
+
+.export-button:hover:not(:disabled) {
+  background: #cbd0d8;
+}
+
+.export-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.download-button {
+  border: 1px solid #474c57;
+  background: #303640;
+  color: #f1f3f6;
+}
+
+.download-button:hover {
+  background: #414955;
+}
+
+.export-status {
+  margin-top: 24px;
+}
+
+.export-status-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: #afb5bf;
+  font-size: 12px;
+}
+
+.export-status-top strong {
+  color: #e9ebee;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.export-progress {
+  height: 5px;
+  width: 100%;
+  overflow: hidden;
+  border-radius: 20px;
+  background: #353b45;
+}
+
+.export-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: #e4e8ed;
+  transition: width 0.15s linear;
+}
+
+.export-progress-fill.processing {
+  background: repeating-linear-gradient(
+    90deg,
+    #dce2e9 0px,
+    #dce2e9 20px,
+    #9fa8b5 20px,
+    #9fa8b5 40px
+  );
+  background-size: 80px 100%;
+  animation: export-processing 1.5s linear infinite;
+}
+
+.export-success {
+  margin: 18px 0 0;
+  color: #b9dfc2;
+  font-size: 13px;
+}
+
+.export-error {
+  margin: 18px 0 0;
+  color: #f0aaa9;
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+@keyframes export-processing {
+  from {
+    background-position: 0 0;
+  }
+
+  to {
+    background-position: 80px 0;
+  }
+}
+
+@media (max-width: 700px) {
+  .export-section {
+    margin: 0 18px 18px;
+    padding: 22px;
+  }
+
+  .export-heading {
+    gap: 12px;
+  }
+
+  .export-heading h3 {
+    font-size: 18px;
+  }
+
+  .export-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .export-button,
+  .download-button {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .export-progress-fill.processing {
+    animation: none;
+  }
+
+  .export-button,
+  .download-button {
+    transition: none;
+  }
+}

@@ -6,6 +6,7 @@ import type { WebGLRenderer } from "three";
 import AvatarModel from "./AvatarModel";
 import "./App.css";
 import "./ExportVideo.css";
+import "./MotionCompare.css";
 
 type MotionResponse = {
   motion_name: string;
@@ -22,162 +23,191 @@ type ExportResponse = {
   download_url: string;
 };
 
-type ExportStage =
-  | "idle"
-  | "recording"
-  | "processing"
-  | "completed"
-  | "error";
+type MotionMode = "baseline" | "viseme" | "smoothed";
+type ExportStage = "idle" | "recording" | "processing" | "completed" | "error";
 
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL ||
-  "http://127.0.0.1:8000";
+const API = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+const PREFIX = "fcee2e9c479544a3b0d8186e421a8eff_15s";
+const AUDIO_FILE = `${PREFIX}.wav`;
 
-const MOTION_FILE =
-  "fcee2e9c479544a3b0d8186e421a8eff_15s_motion.npy";
-
-const AUDIO_FILE =
-  "fcee2e9c479544a3b0d8186e421a8eff_15s.wav";
-
-const WAVEFORM_BARS = 110;
+const MODES: {
+  id: MotionMode;
+  label: string;
+  file: string;
+}[] = [
+  {
+    id: "baseline",
+    label: "Baseline",
+    file: `${PREFIX}_motion.npy`
+  },
+  {
+    id: "viseme",
+    label: "Viseme-Enhanced",
+    file: `${PREFIX}_viseme_motion.npy`
+  },
+  {
+    id: "smoothed",
+    label: "Smoothed Viseme",
+    file: `${PREFIX}_smoothed_motion.npy`
+  }
+];
 
 function formatTime(seconds: number) {
-  if (!Number.isFinite(seconds)) {
-    return "00:00.00";
-  }
-
-  const minutes = Math.floor(seconds / 60);
-  const remaining = (seconds % 60).toFixed(2).padStart(5, "0");
-
-  return `${String(minutes).padStart(2, "0")}:${remaining}`;
+  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  const minutes = Math.floor(safe / 60);
+  const remainder = (safe % 60).toFixed(2).padStart(5, "0");
+  return `${String(minutes).padStart(2, "0")}:${remainder}`;
 }
 
-function createWaveform(
-  samples: Float32Array,
-  count: number
-) {
-  const peaks: number[] = [];
+function makeWaveform(samples: Float32Array, count = 110) {
+  const values: number[] = [];
 
   for (let i = 0; i < count; i++) {
-    const start = Math.floor(
-      (i * samples.length) / count
-    );
-
-    const end = Math.floor(
-      ((i + 1) * samples.length) / count
-    );
-
-    let sum = 0;
+    const start = Math.floor((i * samples.length) / count);
+    const end = Math.floor(((i + 1) * samples.length) / count);
+    let power = 0;
 
     for (let j = start; j < end; j++) {
-      sum += samples[j] * samples[j];
+      power += samples[j] ** 2;
     }
 
-    const length = Math.max(1, end - start);
-    peaks.push(Math.sqrt(sum / length));
+    values.push(Math.sqrt(power / Math.max(1, end - start)));
   }
 
-  const maximum = Math.max(...peaks, 0.0001);
+  const maximum = Math.max(0.0001, ...values);
+  return values.map((value) => Math.max(0.06, value / maximum));
+}
 
-  return peaks.map((peak) =>
-    Math.max(0.06, Math.min(1, peak / maximum))
+function getStatistics(motion?: MotionResponse) {
+  if (!motion || motion.frames < 2) {
+    return null;
+  }
+
+  const values = motion.data.map((frame) => frame[0]);
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const changes = values.slice(1).map(
+    (value, index) => Math.abs(value - values[index])
   );
+
+  return {
+    mean,
+    meanChange: changes.reduce((a, b) => a + b, 0) / changes.length,
+    maxChange: Math.max(...changes),
+    maxOpening: Math.max(...values)
+  };
 }
 
 function App() {
-  const [motion, setMotion] = useState<MotionResponse | null>(null);
+  const [mode, setMode] = useState<MotionMode>("baseline");
+  const [motions, setMotions] = useState<
+    Partial<Record<MotionMode, MotionResponse>>
+  >({});
   const [frameIndex, setFrameIndex] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
-  const [waveformLoading, setWaveformLoading] = useState(true);
   const [waveform, setWaveform] = useState<number[]>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-
-  const [exportStage, setExportStage] =
-    useState<ExportStage>("idle");
-
+  const [exportStage, setExportStage] = useState<ExportStage>("idle");
   const [exportProgress, setExportProgress] = useState(0);
   const [exportError, setExportError] = useState("");
-  const [exportResult, setExportResult] =
-    useState<ExportResponse | null>(null);
+  const [exportResult, setExportResult] = useState<ExportResponse | null>(null);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const rendererRef = useRef<WebGLRenderer | null>(null);
-  const exportLockedRef = useRef(false);
+  const exportingRef = useRef(false);
 
-  const duration = motion
-    ? motion.frames / motion.fps
-    : 0;
-
-  const progress =
-    duration > 0
-      ? Math.min(100, (currentTime / duration) * 100)
-      : 0;
-
-  const isExporting =
-    exportStage === "recording" ||
-    exportStage === "processing";
+  const motion = motions[mode];
+  const duration = motion ? motion.frames / motion.fps : 0;
+  const progress = duration ? Math.min(100, currentTime / duration * 100) : 0;
+  const exporting = exportStage === "recording" || exportStage === "processing";
+  const currentFrame = motion?.data[frameIndex] ?? [0, 0, 0, 0, 0, 0, 0];
+  const statistics = getStatistics(motion);
 
   useEffect(() => {
     const controller = new AbortController();
 
-    const loadMotion = async () => {
+    async function loadMotions() {
       try {
-        const response = await fetch(
-          `${API_BASE_URL}/motion-data/${MOTION_FILE}`,
-          { signal: controller.signal }
+        const entries = await Promise.all(
+          MODES.map(async (item) => {
+            const response = await fetch(
+              `${API}/motion-data/${item.file}`,
+              { signal: controller.signal }
+            );
+
+            if (!response.ok) {
+              throw new Error(`Cannot load ${item.label} motion`);
+            }
+
+            const data: MotionResponse = await response.json();
+
+            if (
+              data.fps <= 0 ||
+              data.frames <= 0 ||
+              !Array.isArray(data.data) ||
+              data.data.length !== data.frames ||
+              data.data.some((frame) =>
+                !Array.isArray(frame) ||
+                frame.length !== 7 ||
+                frame.some((value) => !Number.isFinite(value))
+              )
+            ) {
+              throw new Error(`Invalid motion data: ${item.label}`);
+            }
+
+            return [item.id, data] as const;
+          })
         );
 
-        if (!response.ok) {
-          throw new Error("Unable to load motion data");
+        if (!controller.signal.aborted) {
+          const result = Object.fromEntries(entries) as Record<
+            MotionMode,
+            MotionResponse
+          >;
+
+          const reference = result.baseline;
+
+          if (
+            MODES.some((item) =>
+              result[item.id].frames !== reference.frames ||
+              result[item.id].fps !== reference.fps
+            )
+          ) {
+            throw new Error("Motion sequences have different frame counts or FPS");
+          }
+
+          setMotions(result);
         }
-
-        const result: MotionResponse = await response.json();
-
-        if (
-          !Array.isArray(result.data) ||
-          result.frames <= 0 ||
-          result.fps <= 0 ||
-          result.data.length !== result.frames
-        ) {
-          throw new Error("Invalid motion data");
-        }
-
-        setMotion(result);
       } catch (err) {
         if (!controller.signal.aborted) {
-          setError(
-            err instanceof Error
-              ? err.message
-              : "Unable to load motion data"
-          );
+          setError(err instanceof Error ? err.message : "Motion loading failed");
         }
       } finally {
         if (!controller.signal.aborted) {
-          setIsLoading(false);
+          setLoading(false);
         }
       }
-    };
+    }
 
-    loadMotion();
-
+    void loadMotions();
     return () => controller.abort();
   }, []);
 
   useEffect(() => {
     const controller = new AbortController();
-    const context = new AudioContext();
 
-    const loadWaveform = async () => {
+    async function loadWaveform() {
+      let context: AudioContext | null = null;
+
       try {
         const response = await fetch(
-          `${API_BASE_URL}/test-audio/${AUDIO_FILE}`,
+          `${API}/test-audio/${AUDIO_FILE}`,
           { signal: controller.signal }
         );
 
         if (!response.ok) {
-          throw new Error("Unable to load waveform");
+          throw new Error("Audio unavailable");
         }
 
         const buffer = await response.arrayBuffer();
@@ -186,58 +216,33 @@ function App() {
           return;
         }
 
+        context = new AudioContext();
         const decoded = await context.decodeAudioData(buffer);
 
-        if (controller.signal.aborted) {
-          return;
+        if (!controller.signal.aborted) {
+          setWaveform(makeWaveform(decoded.getChannelData(0)));
         }
-
-        setWaveform(
-          createWaveform(
-            decoded.getChannelData(0),
-            WAVEFORM_BARS
-          )
-        );
       } catch {
         if (!controller.signal.aborted) {
           setWaveform([]);
         }
       } finally {
-        if (!controller.signal.aborted) {
-          setWaveformLoading(false);
+        if (context) {
+          void context.close().catch(() => {});
         }
-
-        void context.close().catch(() => {});
       }
-    };
+    }
 
-    loadWaveform();
-
-    return () => {
-      controller.abort();
-      void context.close().catch(() => {});
-    };
+    void loadWaveform();
+    return () => controller.abort();
   }, []);
 
-  const updatePosition = (
-    seconds: number,
-    activeMotion: MotionResponse
-  ) => {
-    const maximum =
-      activeMotion.frames / activeMotion.fps;
+  const updatePosition = (time: number, active: MotionResponse) => {
+    const safe = Math.min(Math.max(0, time), active.frames / active.fps);
+    const frame = Math.min(active.frames - 1, Math.floor(safe * active.fps));
 
-    const safeTime = Math.max(
-      0,
-      Math.min(seconds, maximum)
-    );
-
-    const nextFrame = Math.min(
-      activeMotion.frames - 1,
-      Math.floor(safeTime * activeMotion.fps)
-    );
-
-    setCurrentTime(safeTime);
-    setFrameIndex(nextFrame);
+    setCurrentTime(safe);
+    setFrameIndex(frame);
   };
 
   useEffect(() => {
@@ -247,7 +252,7 @@ function App() {
 
     let animationId = 0;
 
-    const update = () => {
+    const tick = () => {
       const audio = audioRef.current;
 
       if (!audio || audio.paused || audio.ended) {
@@ -256,134 +261,116 @@ function App() {
 
       updatePosition(audio.currentTime, motion);
 
-      if (exportLockedRef.current) {
+      if (exportingRef.current) {
         setExportProgress(
-          Math.min(
-            100,
-            (audio.currentTime / duration) * 100
-          )
+          Math.min(100, audio.currentTime / duration * 100)
         );
       }
 
-      animationId = requestAnimationFrame(update);
+      animationId = requestAnimationFrame(tick);
     };
 
-    animationId = requestAnimationFrame(update);
-
+    animationId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(animationId);
   }, [isPlaying, motion, duration]);
 
-  const handlePlay = async () => {
-    if (!motion || !audioRef.current || isExporting) {
-      return;
-    }
-
-    try {
-      const audio = audioRef.current;
-
-      if (audio.ended || audio.currentTime >= duration) {
-        audio.currentTime = 0;
-        updatePosition(0, motion);
-      }
-
-      await audio.play();
-      setError("");
-    } catch {
-      setError("Unable to play the audio file");
-    }
-  };
-
-  const handlePause = () => {
-    if (isExporting) {
+  const selectMode = (next: MotionMode) => {
+    if (exporting || !motions[next]) {
       return;
     }
 
     audioRef.current?.pause();
+
+    if (audioRef.current) {
+      audioRef.current.currentTime = 0;
+    }
+
+    setMode(next);
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setFrameIndex(0);
+    setExportResult(null);
+    setExportStage("idle");
+    setExportError("");
   };
 
-  const handleReset = () => {
-    if (!motion || !audioRef.current || isExporting) {
+  const play = async () => {
+    if (!audioRef.current || !motion || exporting) {
+      return;
+    }
+
+    try {
+      if (audioRef.current.ended || audioRef.current.currentTime >= duration) {
+        audioRef.current.currentTime = 0;
+        updatePosition(0, motion);
+      }
+
+      await audioRef.current.play();
+      setError("");
+    } catch {
+      setError("Unable to play audio");
+    }
+  };
+
+  const pause = () => {
+    if (!exporting) {
+      audioRef.current?.pause();
+    }
+  };
+
+  const seek = (seconds: number) => {
+    if (!audioRef.current || !motion || exporting) {
+      return;
+    }
+
+    const time = Math.min(Math.max(0, seconds), duration);
+    audioRef.current.currentTime = time;
+    updatePosition(time, motion);
+  };
+
+  const reset = () => {
+    if (!audioRef.current || !motion || exporting) {
       return;
     }
 
     audioRef.current.pause();
     audioRef.current.currentTime = 0;
-
     updatePosition(0, motion);
     setIsPlaying(false);
   };
 
-  const handleSeek = (seconds: number) => {
-    if (!motion || !audioRef.current || isExporting) {
-      return;
-    }
-
-    const safeTime = Math.max(
-      0,
-      Math.min(seconds, duration)
-    );
-
-    audioRef.current.currentTime = safeTime;
-    updatePosition(safeTime, motion);
-  };
-
-  const skipTime = (seconds: number) => {
-    if (!audioRef.current) {
-      return;
-    }
-
-    handleSeek(
-      audioRef.current.currentTime + seconds
-    );
-  };
-
-  const handleExport = async () => {
+  const exportVideo = async () => {
     const audio = audioRef.current;
     const canvas = rendererRef.current?.domElement;
 
-    if (
-      !motion ||
-      !audio ||
-      !canvas ||
-      exportLockedRef.current
-    ) {
+    if (!audio || !canvas || !motion || exportingRef.current) {
       return;
     }
 
-    if (
-      typeof MediaRecorder === "undefined" ||
-      typeof canvas.captureStream !== "function"
-    ) {
-      setExportStage("error");
-      setExportError(
-        "This browser does not support canvas video recording."
-      );
-      return;
-    }
-
-    const mimeType = [
+    const mime = [
       "video/webm;codecs=vp9",
       "video/webm;codecs=vp8",
       "video/webm"
-    ].find((type) => MediaRecorder.isTypeSupported(type));
+    ].find((value) =>
+      typeof MediaRecorder !== "undefined" &&
+      MediaRecorder.isTypeSupported(value)
+    );
 
-    if (!mimeType) {
+    if (!mime || typeof canvas.captureStream !== "function") {
       setExportStage("error");
-      setExportError(
-        "WebM recording is not supported. Try Chrome on your laptop."
-      );
+      setExportError("WebM canvas recording is not supported in this browser");
       return;
     }
 
-    exportLockedRef.current = true;
-
+    exportingRef.current = true;
+    setExportStage("recording");
+    setExportProgress(0);
     setExportError("");
     setExportResult(null);
-    setExportProgress(0);
-    setExportStage("recording");
 
     let stream: MediaStream | null = null;
     let recorder: MediaRecorder | null = null;
+    let watchdog: number | undefined;
 
     try {
       audio.pause();
@@ -392,24 +379,23 @@ function App() {
 
       if (audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
         await new Promise<void>((resolve, reject) => {
-          const onReady = () => {
+          const ready = () => {
             cleanup();
             resolve();
           };
 
-          const onError = () => {
+          const failed = () => {
             cleanup();
-            reject(new Error("Source audio could not be loaded"));
+            reject(new Error("Source audio failed to load"));
           };
 
           const cleanup = () => {
-            audio.removeEventListener("loadeddata", onReady);
-            audio.removeEventListener("error", onError);
+            audio.removeEventListener("loadeddata", ready);
+            audio.removeEventListener("error", failed);
           };
 
-          audio.addEventListener("loadeddata", onReady);
-          audio.addEventListener("error", onError);
-
+          audio.addEventListener("loadeddata", ready);
+          audio.addEventListener("error", failed);
           audio.load();
         });
       }
@@ -417,80 +403,73 @@ function App() {
       stream = canvas.captureStream(30);
 
       if (!stream.getVideoTracks().length) {
-        throw new Error("Unable to capture the 3D canvas");
+        throw new Error("Unable to capture the avatar viewport");
       }
 
       recorder = new MediaRecorder(stream, {
-        mimeType,
+        mimeType: mime,
         videoBitsPerSecond: 5_000_000
       });
 
-      const chunks: Blob[] = [];
       const activeRecorder = recorder;
+      const chunks: Blob[] = [];
 
-      const recordingPromise = new Promise<Blob>(
-        (resolve, reject) => {
-          activeRecorder.ondataavailable = (event) => {
-            if (event.data.size > 0) {
-              chunks.push(event.data);
-            }
-          };
+      const finished = new Promise<Blob>((resolve, reject) => {
+        activeRecorder.ondataavailable = (event) => {
+          if (event.data.size) {
+            chunks.push(event.data);
+          }
+        };
 
-          activeRecorder.onerror = () => {
-            reject(new Error("Video recording failed"));
-          };
+        activeRecorder.onerror = () => {
+          reject(new Error("Browser recording failed"));
+        };
 
-          activeRecorder.onstop = () => {
-            const blob = new Blob(chunks, {
-              type: "video/webm"
-            });
+        activeRecorder.onstop = () => {
+          const blob = new Blob(chunks, { type: "video/webm" });
 
-            if (blob.size === 0) {
-              reject(new Error("The recorded video is empty"));
-              return;
-            }
-
+          if (!blob.size) {
+            reject(new Error("Recorded video is empty"));
+          } else {
             resolve(blob);
-          };
-        }
-      );
+          }
+        };
+      });
 
-      const endRecording = () => {
+      const stop = () => {
         if (activeRecorder.state !== "inactive") {
           activeRecorder.stop();
         }
       };
 
-      audio.addEventListener("ended", endRecording, {
-        once: true
-      });
+      audio.addEventListener("ended", stop, { once: true });
 
       try {
         activeRecorder.start(250);
 
+        watchdog = window.setTimeout(
+          stop,
+          Math.ceil((duration + 5) * 1000)
+        );
+
         await audio.play();
 
-        const recording = await recordingPromise;
+        const blob = await finished;
+
+        if (audio.currentTime < duration - 0.5) {
+          throw new Error("Recording ended before the audio completed");
+        }
 
         setExportStage("processing");
 
-        const formData = new FormData();
+        const body = new FormData();
+        body.append("recording", blob, "avatar-recording.webm");
+        body.append("audio_name", AUDIO_FILE);
 
-        formData.append(
-          "recording",
-          recording,
-          "avatar-recording.webm"
-        );
-
-        formData.append("audio_name", AUDIO_FILE);
-
-        const response = await fetch(
-          `${API_BASE_URL}/export-video`,
-          {
-            method: "POST",
-            body: formData
-          }
-        );
+        const response = await fetch(`${API}/export-video`, {
+          method: "POST",
+          body
+        });
 
         const result = await response.json();
 
@@ -498,54 +477,44 @@ function App() {
           throw new Error(
             typeof result.detail === "string"
               ? result.detail
-              : "Video export failed"
+              : "MP4 export failed"
           );
         }
 
         setExportResult(result as ExportResponse);
-        setExportProgress(100);
         setExportStage("completed");
+        setExportProgress(100);
       } finally {
-        audio.removeEventListener(
-          "ended",
-          endRecording
-        );
+        audio.removeEventListener("ended", stop);
       }
     } catch (err) {
-      if (recorder && recorder.state !== "inactive") {
-        recorder.stop();
+      if (recorder && (recorder as MediaRecorder).state !== "inactive") {
+        (recorder as MediaRecorder).stop();
       }
 
       setExportStage("error");
       setExportError(
-        err instanceof Error
-          ? err.message
-          : "Unable to export video"
+        err instanceof Error ? err.message : "Video export failed"
       );
     } finally {
-      stream?.getTracks().forEach((track) => track.stop());
+      if (watchdog !== undefined) {
+        clearTimeout(watchdog);
+      }
 
+      stream?.getTracks().forEach((track) => track.stop());
       audio.pause();
       audio.currentTime = 0;
       updatePosition(0, motion);
-
       setIsPlaying(false);
-      exportLockedRef.current = false;
+      exportingRef.current = false;
     }
   };
 
-  const currentFrame =
-    motion?.data[frameIndex] ??
-    [0, 0, 0, 0, 0, 0, 0];
-
-  const parameterValues = [
-    { name: "Mouth Open", value: currentFrame[0] },
-    { name: "Mouth Width", value: currentFrame[1] },
-    { name: "Brow Raise", value: currentFrame[2] },
-    {
-      name: "Gesture Intensity",
-      value: currentFrame[6]
-    }
+  const parameters = [
+    { label: "Mouth Open", value: currentFrame[0] },
+    { label: "Mouth Width", value: currentFrame[1] },
+    { label: "Brow Raise", value: currentFrame[2] },
+    { label: "Gesture Intensity", value: currentFrame[6] }
   ];
 
   return (
@@ -553,13 +522,11 @@ function App() {
       <header className="studio-header">
         <div className="brand">
           <div className="brand-symbol">DH</div>
-
           <div className="brand-text">
             <strong>Digital Human</strong>
             <span>Animation Studio</span>
           </div>
         </div>
-
         <div className="header-status">
           <span className="status-dot" />
           <span>Development Workspace</span>
@@ -568,31 +535,50 @@ function App() {
 
       <section className="studio-content">
         <div className="intro">
-          <p className="section-label">
-            AUDIO-DRIVEN ANIMATION
-          </p>
-
+          <p className="section-label">AUDIO-DRIVEN ANIMATION</p>
           <h1>Bring motion to life.</h1>
-
-          <p>
-            Explore speech-driven motion through an
-            interactive 3D animation workspace.
-          </p>
+          <p>Explore, compare and export audio-driven facial animation.</p>
         </div>
 
+        <section className="motion-compare">
+          <div className="compare-intro">
+            <span className="panel-kicker">ANIMATION MODE</span>
+            <h2>Motion comparison</h2>
+            <p>
+              Compare original, speech-token-based and temporally
+              smoothed motion on the same avatar.
+            </p>
+          </div>
+
+          <div className="mode-switch" role="group" aria-label="Motion mode">
+            {MODES.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={
+                  mode === item.id
+                    ? "mode-option active"
+                    : "mode-option"
+                }
+                onClick={() => selectMode(item.id)}
+                disabled={exporting || !motions[item.id]}
+                aria-pressed={mode === item.id}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
         <div className="studio-grid">
-          <div className="preview-panel">
+          <section className="preview-panel">
             <div className="panel-header">
               <div>
-                <span className="panel-kicker">
-                  REAL-TIME VIEWPORT
-                </span>
-
+                <span className="panel-kicker">REAL-TIME VIEWPORT</span>
                 <h2>3D Avatar</h2>
               </div>
-
               <span className="preview-tag">
-                FACE MODEL
+                {MODES.find((item) => item.id === mode)?.label}
               </span>
             </div>
 
@@ -609,21 +595,11 @@ function App() {
                 }}
               >
                 <ambientLight intensity={2} />
-
-                <directionalLight
-                  position={[3, 5, 5]}
-                  intensity={3}
-                />
-
-                <directionalLight
-                  position={[-3, 2, -2]}
-                  intensity={1.5}
-                />
-
+                <directionalLight position={[3, 5, 5]} intensity={3} />
+                <directionalLight position={[-3, 2, -2]} intensity={1.5} />
                 <Suspense fallback={null}>
                   <AvatarModel frame={currentFrame} />
                 </Suspense>
-
                 <OrbitControls
                   target={[0, 0.15, -0.2]}
                   enableDamping
@@ -642,123 +618,90 @@ function App() {
             <div className="timeline-section">
               <div className="timeline-heading">
                 <div>
-                  <span className="panel-kicker">
-                    AUDIO TIMELINE
-                  </span>
-
+                  <span className="panel-kicker">AUDIO TIMELINE</span>
                   <h3>Motion Sequence</h3>
                 </div>
-
                 <span className="timeline-duration">
-                  {formatTime(currentTime)} /{" "}
-                  {formatTime(duration)}
+                  {formatTime(currentTime)} / {formatTime(duration)}
                 </span>
               </div>
 
               <div className="waveform-container">
                 <div className="waveform-bars">
-                  {waveformLoading ? (
-                    <span className="waveform-placeholder">
-                      Loading audio waveform...
-                    </span>
-                  ) : waveform.length ? (
-                    waveform.map((height, index) => {
-                      const barProgress =
-                        ((index + 0.5) /
-                          waveform.length) *
-                        100;
-
-                      return (
-                        <span
-                          className={`waveform-bar ${
-                            barProgress <= progress
-                              ? "played"
-                              : ""
-                          }`}
-                          key={index}
-                          style={{
-                            height: `${
-                              Math.max(8, height * 100)
-                            }%`
-                          }}
-                        />
-                      );
-                    })
+                  {waveform.length ? (
+                    waveform.map((height, index) => (
+                      <span
+                        key={index}
+                        className={
+                          ((index + 0.5) / waveform.length) * 100 <= progress
+                            ? "waveform-bar played"
+                            : "waveform-bar"
+                        }
+                        style={{ height: `${Math.max(8, height * 100)}%` }}
+                      />
+                    ))
                   ) : (
                     <span className="waveform-placeholder">
-                      Waveform unavailable
+                      Loading waveform or audio unavailable
                     </span>
                   )}
                 </div>
-
                 <div
                   className="timeline-playhead"
                   style={{ left: `${progress}%` }}
                 />
-
                 <input
                   className="timeline-range"
                   type="range"
-                  min="0"
+                  min={0}
                   max={duration || 1}
-                  step="0.01"
+                  step={0.01}
                   value={currentTime}
-                  onChange={(event) =>
-                    handleSeek(
-                      Number(event.target.value)
-                    )
-                  }
-                  disabled={!motion || isExporting}
-                  aria-label="Seek animation timeline"
+                  onChange={(event) => seek(Number(event.target.value))}
+                  disabled={!motion || exporting}
+                  aria-label="Seek animation"
                 />
               </div>
 
               <div className="timeline-markers">
-                <span>00:00</span>
-                <span>{formatTime(duration / 4)}</span>
-                <span>{formatTime(duration / 2)}</span>
-                <span>
-                  {formatTime((duration * 3) / 4)}
-                </span>
-                <span>{formatTime(duration)}</span>
+                {[0, 0.25, 0.5, 0.75, 1].map((position) => (
+                  <span key={position}>
+                    {formatTime(duration * position)}
+                  </span>
+                ))}
               </div>
 
               <div className="transport-controls">
                 <div className="transport-buttons">
                   <button
-                    className="icon-button"
                     type="button"
-                    onClick={() => skipTime(-5)}
-                    disabled={!motion || isExporting}
+                    className="icon-button"
+                    onClick={() => seek(currentTime - 5)}
+                    disabled={!motion || exporting}
                   >
                     −5s
                   </button>
-
                   <button
-                    className="primary-button"
                     type="button"
-                    onClick={
-                      isPlaying ? handlePause : handlePlay
-                    }
-                    disabled={!motion || isExporting}
+                    className="primary-button"
+                    onClick={isPlaying ? pause : play}
+                    disabled={!motion || exporting}
                   >
                     {isPlaying ? "Pause" : "Play"}
                   </button>
-
                   <button
-                    className="icon-button"
                     type="button"
-                    onClick={() => skipTime(5)}
-                    disabled={!motion || isExporting}
+                    className="icon-button"
+                    onClick={() => seek(currentTime + 5)}
+                    disabled={!motion || exporting}
                   >
                     +5s
                   </button>
-
                   <button
-                    className="secondary-button"
                     type="button"
-                    onClick={handleReset}
-                    disabled={!motion || isExporting}
+                    className="secondary-button"
+                    onClick={reset}
+                    disabled={!motion || exporting}
                   >
                     Reset
                   </button>
@@ -767,13 +710,9 @@ function App() {
                 <div className="frame-indicator">
                   <span>FRAME</span>
                   <strong>
-                    {motion
-                      ? String(frameIndex + 1).padStart(3, "0")
-                      : "000"}
+                    {motion ? String(frameIndex + 1).padStart(3, "0") : "000"}
                   </strong>
-                  <span>
-                    / {motion?.frames ?? 0}
-                  </span>
+                  <span>/ {motion?.frames ?? 0}</span>
                 </div>
               </div>
             </div>
@@ -781,18 +720,13 @@ function App() {
             <section className="export-section">
               <div className="export-heading">
                 <div>
-                  <span className="panel-kicker">
-                    VIDEO OUTPUT
-                  </span>
-
+                  <span className="panel-kicker">VIDEO OUTPUT</span>
                   <h3>Export Animation</h3>
-
                   <p>
-                    Record the animated avatar and combine
-                    it with the original audio.
+                    Record the selected motion mode and combine it
+                    with the original audio.
                   </p>
                 </div>
-
                 <span className="export-format">MP4</span>
               </div>
 
@@ -800,11 +734,11 @@ function App() {
                 <button
                   type="button"
                   className="export-button"
-                  onClick={handleExport}
-                  disabled={!motion || isExporting}
+                  onClick={exportVideo}
+                  disabled={!motion || exporting}
                 >
                   {exportStage === "recording"
-                    ? "Recording Animation..."
+                    ? "Recording..."
                     : exportStage === "processing"
                       ? "Encoding MP4..."
                       : "Export MP4"}
@@ -813,7 +747,7 @@ function App() {
                 {exportResult && (
                   <a
                     className="download-button"
-                    href={`${API_BASE_URL}${exportResult.download_url}`}
+                    href={`${API}${exportResult.download_url}`}
                     download
                   >
                     Download Video
@@ -821,22 +755,20 @@ function App() {
                 )}
               </div>
 
-              {isExporting && (
+              {exporting && (
                 <div className="export-status">
                   <div className="export-status-top">
                     <span>
                       {exportStage === "recording"
-                        ? "Capturing 3D animation"
-                        : "Processing video with FFmpeg"}
+                        ? "Capturing animation"
+                        : "Encoding with FFmpeg"}
                     </span>
-
                     <strong>
                       {exportStage === "recording"
                         ? `${Math.round(exportProgress)}%`
-                        : "Encoding"}
+                        : "Processing"}
                     </strong>
                   </div>
-
                   <div className="export-progress">
                     <div
                       className={
@@ -845,10 +777,9 @@ function App() {
                           : "export-progress-fill"
                       }
                       style={{
-                        width:
-                          exportStage === "recording"
-                            ? `${exportProgress}%`
-                            : "100%"
+                        width: exportStage === "processing"
+                          ? "100%"
+                          : `${exportProgress}%`
                       }}
                     />
                   </div>
@@ -856,139 +787,120 @@ function App() {
               )}
 
               {exportStage === "completed" && (
-                <p className="export-success">
-                  MP4 video exported successfully.
-                </p>
+                <p className="export-success">MP4 exported successfully.</p>
               )}
 
               {exportError && (
-                <p className="export-error">
-                  {exportError}
-                </p>
+                <p className="export-error">{exportError}</p>
               )}
             </section>
-          </div>
+          </section>
 
           <aside className="details-panel">
             <div className="details-header">
-              <span className="panel-kicker">
-                MOTION INSPECTOR
-              </span>
-
+              <span className="panel-kicker">MOTION INSPECTOR</span>
               <h2>Animation Data</h2>
-
-              <p>
-                Inspect audio-derived motion parameters
-                as the timeline plays.
-              </p>
+              <p>Inspect the selected motion sequence at each frame.</p>
             </div>
 
-            <div className="data-item">
-              <span>Avatar Model</span>
-              <strong>Facecap 3D</strong>
-            </div>
-
-            <div className="data-item">
-              <span>Total Frames</span>
-              <strong>{motion?.frames ?? "—"}</strong>
-            </div>
-
-            <div className="data-item">
-              <span>Frame Rate</span>
-              <strong>
-                {motion ? `${motion.fps} FPS` : "—"}
-              </strong>
-            </div>
-
-            <div className="data-item">
-              <span>Motion Dimensions</span>
-              <strong>
-                {motion?.parameters.length ?? "—"}
-              </strong>
-            </div>
-
-            <div className="data-item">
-              <span>Current Frame</span>
-              <strong>
-                {motion ? frameIndex + 1 : "—"}
-              </strong>
-            </div>
+            {[
+              ["Mode", MODES.find((item) => item.id === mode)?.label ?? "—"],
+              ["Frames", motion?.frames ?? "—"],
+              ["Frame Rate", motion ? `${motion.fps} FPS` : "—"],
+              ["Dimensions", motion?.parameters.length ?? "—"],
+              ["Current Frame", motion ? frameIndex + 1 : "—"]
+            ].map(([label, value]) => (
+              <div className="data-item" key={label}>
+                <span>{label}</span>
+                <strong>{value}</strong>
+              </div>
+            ))}
 
             <div className="motion-heading">
-              <span className="panel-kicker">
-                ACTIVE PARAMETERS
-              </span>
+              <span className="panel-kicker">ACTIVE PARAMETERS</span>
             </div>
 
-            {parameterValues.map((item) => {
-              const value = Math.max(
-                0,
-                Math.min(1, item.value ?? 0)
+            {parameters.map((parameter) => {
+              const value = Math.min(
+                1,
+                Math.max(0, parameter.value ?? 0)
               );
 
               return (
-                <div className="parameter" key={item.name}>
+                <div className="parameter" key={parameter.label}>
                   <div className="parameter-top">
-                    <span>{item.name}</span>
-                    <strong>
-                      {(value * 100).toFixed(0)}%
-                    </strong>
+                    <span>{parameter.label}</span>
+                    <strong>{(value * 100).toFixed(0)}%</strong>
                   </div>
-
                   <div className="parameter-track">
                     <div
                       className="parameter-fill"
-                      style={{
-                        width: `${value * 100}%`
-                      }}
+                      style={{ width: `${value * 100}%` }}
                     />
                   </div>
                 </div>
               );
             })}
 
-            <div className="inspector-footer">
-              <span className="status-dot" />
+            <div className="difference-panel">
+              <span className="panel-kicker">MOTION ANALYSIS</span>
 
-              {isLoading
-                ? "Loading animation data"
-                : motion
-                  ? "Motion sequence ready"
-                  : "Motion sequence unavailable"}
+              {statistics && (
+                <>
+                  {[
+                    ["Mean Mouth Opening", statistics.mean],
+                    ["Mean Frame Change", statistics.meanChange],
+                    ["Maximum Frame Change", statistics.maxChange],
+                    ["Maximum Mouth Opening", statistics.maxOpening]
+                  ].map(([label, value]) => (
+                    <div className="difference-row" key={label}>
+                      <span>{label}</span>
+                      <strong>{Number(value).toFixed(5)}</strong>
+                    </div>
+                  ))}
+                </>
+              )}
+
+              <p>
+                These values describe motion behavior. They do not
+                measure speech accuracy or lip-sync quality.
+              </p>
             </div>
 
-            {error && (
-              <p className="error-message">{error}</p>
-            )}
+            <div className="inspector-footer">
+              <span className="status-dot" />
+              {loading
+                ? "Loading motion sequences"
+                : motion
+                  ? "Motion data ready"
+                  : "Motion data unavailable"}
+            </div>
+
+            {error && <p className="error-message">{error}</p>}
           </aside>
         </div>
 
         <p className="development-note">
-          Facial motion currently uses a procedural
-          audio-feature baseline. Video export captures
-          the live 3D preview and combines it with audio.
+          All three modes use experimental audio-derived motion.
+          Smoothness measurements do not establish lip-sync accuracy.
         </p>
       </section>
 
       <audio
         ref={audioRef}
         preload="auto"
-        src={`${API_BASE_URL}/test-audio/${AUDIO_FILE}`}
+        src={`${API}/test-audio/${AUDIO_FILE}`}
+        onPlay={() => setIsPlaying(true)}
+        onPause={() => setIsPlaying(false)}
         onEnded={() => {
           setIsPlaying(false);
-
           if (motion) {
             updatePosition(duration, motion);
           }
         }}
-        onPause={() => setIsPlaying(false)}
-        onPlay={() => setIsPlaying(true)}
         onTimeUpdate={(event) => {
           if (motion) {
-            updatePosition(
-              event.currentTarget.currentTime,
-              motion
-            );
+            updatePosition(event.currentTarget.currentTime, motion);
           }
         }}
       />

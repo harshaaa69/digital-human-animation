@@ -1,14 +1,71 @@
 
-import { useMemo, useEffect } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useFrame, useLoader, useThree } from "@react-three/fiber";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
-import type { Mesh, Object3D } from "three";
+import { MathUtils, Mesh, Object3D } from "three";
 
 type AvatarModelProps = {
   frame: number[];
 };
+
+type MorphMesh = Mesh & {
+  morphTargetDictionary: Record<string, number>;
+  morphTargetInfluences: number[];
+};
+
+const MORPH_ALIASES: Record<string, string> = {
+  browouterupleft: "browouterupleft",
+  browouterupright: "browouterupright",
+  browouterupl: "browouterupleft",
+  browouterupr: "browouterupright",
+  mouthstretchl: "mouthstretchleft",
+  mouthstretchr: "mouthstretchright",
+  mouthstretchleft: "mouthstretchleft",
+  mouthstretchright: "mouthstretchright",
+  mouthpressl: "mouthpressleft",
+  mouthpressr: "mouthpressright",
+  mouthpressleft: "mouthpressleft",
+  mouthpressright: "mouthpressright",
+  mouthsmilel: "mouthsmileleft",
+  mouthsmiler: "mouthsmileright",
+  mouthsmileleft: "mouthsmileleft",
+  mouthsmileright: "mouthsmileright",
+  mouthlowerdownl: "mouthlowerdownleft",
+  mouthlowerdownr: "mouthlowerdownright",
+  mouthlowerdownleft: "mouthlowerdownleft",
+  mouthlowerdownright: "mouthlowerdownright",
+};
+
+function clamp(value: number): number {
+  return MathUtils.clamp(
+    Number.isFinite(value) ? value : 0,
+    0,
+    1
+  );
+}
+
+function normalizeName(name: string): string {
+  const normalized =
+    name
+      .split(".")
+      .pop()
+      ?.replace(/[^a-zA-Z0-9]/g, "")
+      .toLowerCase() ?? "";
+
+  return MORPH_ALIASES[normalized] ?? normalized;
+}
+
+function isMorphMesh(object: Object3D): object is MorphMesh {
+  const mesh = object as Mesh;
+
+  return Boolean(
+    mesh.isMesh &&
+      mesh.morphTargetDictionary &&
+      mesh.morphTargetInfluences
+  );
+}
 
 function AvatarModel({ frame }: AvatarModelProps) {
   const gl = useThree((state) => state.gl);
@@ -30,30 +87,72 @@ function AvatarModel({ frame }: AvatarModelProps) {
 
   const scene = gltf.scene;
 
-  useEffect(() => {
-    scene.traverse((object: Object3D) => {
-      const mesh = object as Mesh;
+  const meshes = useRef<MorphMesh[]>([]);
+  const currentFrame = useRef<number[]>(
+    Array(11).fill(0)
+  );
 
-      if (
-        mesh.morphTargetDictionary &&
-        mesh.morphTargetInfluences
-      ) {
-        console.log(
-          "Avatar mesh:",
-          mesh.name,
-          mesh.morphTargetDictionary
-        );
+  useEffect(() => {
+    const found: MorphMesh[] = [];
+
+    scene.traverse((object: Object3D) => {
+      if (isMorphMesh(object)) {
+        found.push(object);
       }
     });
+
+    meshes.current = found;
+
+    return () => {
+      meshes.current = [];
+    };
   }, [scene]);
 
-  useFrame(() => {
-    const mouthOpen = frame[0] ?? 0;
-    const mouthWidth = frame[1] ?? 0;
-    const browRaise = frame[2] ?? 0;
-    const headYaw = frame[3] ?? 0;
-    const headPitch = frame[4] ?? 0;
-    const headRoll = frame[5] ?? 0;
+  useFrame((_, delta) => {
+    const alpha = 1 - Math.exp(
+      -Math.min(delta, 0.1) * 18
+    );
+
+    const current = currentFrame.current;
+
+    for (let index = 0; index < 11; index++) {
+      const target = clamp(frame[index] ?? 0);
+
+      current[index] = MathUtils.lerp(
+        current[index],
+        target,
+        alpha
+      );
+    }
+
+    const mouthOpen = current[0];
+    const mouthWidth = current[1];
+    const browRaise = current[2];
+    const headYaw = current[3];
+    const headPitch = current[4];
+    const headRoll = current[5];
+
+    const hasFacialChannels = frame.length >= 11;
+
+    const lipClosure = hasFacialChannels
+      ? current[7]
+      : clamp((1 - mouthOpen) * 0.15);
+
+    const lipRounding = hasFacialChannels
+      ? current[8]
+      : clamp((1 - mouthWidth) * mouthOpen * 0.5);
+
+    const lipStretch = hasFacialChannels
+      ? current[9]
+      : clamp(mouthWidth * 0.4);
+
+    const lowerLipContact = hasFacialChannels
+      ? current[10]
+      : 0;
+
+    const effectiveJawOpen = clamp(
+      mouthOpen * (1 - lipClosure * 0.8)
+    );
 
     scene.rotation.set(
       headPitch * 0.5,
@@ -61,65 +160,84 @@ function AvatarModel({ frame }: AvatarModelProps) {
       headRoll * 0.5
     );
 
-    scene.traverse((object: Object3D) => {
-      const mesh = object as Mesh;
+    const values: Record<string, number> = {
+      jawopen: effectiveJawOpen,
 
-      if (
-        !mesh.morphTargetDictionary ||
-        !mesh.morphTargetInfluences
-      ) {
-        return;
-      }
+      mouthclose: clamp(lipClosure),
 
-      const dictionary = mesh.morphTargetDictionary;
-      const influences = mesh.morphTargetInfluences;
+      mouthpressleft: clamp(
+        lipClosure * 0.48
+      ),
 
-      const setMorph = (
-        names: string[],
-        value: number
-      ) => {
-        Object.entries(dictionary).forEach(
-          ([name, index]) => {
-            const normalizedName = name
-              .split(".")
-              .pop()
-              ?.toLowerCase();
+      mouthpressright: clamp(
+        lipClosure * 0.48
+      ),
 
-            if (
-              normalizedName &&
-              names.some(
-                (target) =>
-                  normalizedName === target.toLowerCase()
-              )
-            ) {
-              influences[index] = Math.max(
-                0,
-                Math.min(1, value)
-              );
-            }
-          }
-        );
-      };
+      mouthfunnel: clamp(
+        lipRounding * 0.75
+      ),
 
-      setMorph(
-        ["jawOpen", "mouthOpen"],
-        mouthOpen
-      );
+      mouthpucker: clamp(
+        lipRounding * 0.55
+      ),
 
-      setMorph(
-        ["mouthStretchLeft", "mouthStretchRight"],
-        mouthWidth * 0.4
-      );
+      mouthstretchleft: clamp(
+        lipStretch * 0.65
+      ),
 
-      setMorph(
-        [
-          "browInnerUp",
-          "browOuterUpLeft",
-          "browOuterUpRight"
-        ],
+      mouthstretchright: clamp(
+        lipStretch * 0.65
+      ),
+
+      mouthsmileleft: clamp(
+        Math.max(0, mouthWidth - 0.6) * 0.2
+      ),
+
+      mouthsmileright: clamp(
+        Math.max(0, mouthWidth - 0.6) * 0.2
+      ),
+
+      mouthrolllower: clamp(
+        lowerLipContact * 0.5
+      ),
+
+      mouthshruglower: clamp(
+        lowerLipContact * 0.35
+      ),
+
+      mouthlowerdownleft: clamp(
+        mouthOpen * 0.22
+      ),
+
+      mouthlowerdownright: clamp(
+        mouthOpen * 0.22
+      ),
+
+      browinnerup: clamp(
         browRaise * 0.6
-      );
-    });
+      ),
+
+      browouterupleft: clamp(
+        browRaise * 0.6
+      ),
+
+      browouterupright: clamp(
+        browRaise * 0.6
+      ),
+    };
+
+    for (const mesh of meshes.current) {
+      for (const [name, index] of Object.entries(
+        mesh.morphTargetDictionary
+      )) {
+        const normalized = normalizeName(name);
+        const value = values[normalized];
+
+        if (value !== undefined) {
+          mesh.morphTargetInfluences[index] = clamp(value);
+        }
+      }
+    }
   });
 
   return <primitive object={scene} />;

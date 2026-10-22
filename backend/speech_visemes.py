@@ -1,11 +1,12 @@
 
 import argparse
 import json
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import cmudict
 import librosa
-import numpy as np
 import torch
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
@@ -14,7 +15,22 @@ MODEL_NAME = "facebook/wav2vec2-base-960h"
 SAMPLE_RATE = 16000
 MAX_DURATION = 20
 
-VISEME_GROUPS = {
+PRONUNCIATIONS = cmudict.dict()
+
+PHONEME_GROUPS = {
+    "closed_lips": {"P", "B", "M"},
+    "teeth_lip": {"F", "V"},
+    "rounded": {"OW", "UW", "UH", "AO", "W"},
+    "wide": {"IY", "IH", "EY", "EH", "Y"},
+    "open": {"AA", "AE", "AH", "AW", "AY", "ER"},
+    "tongue": {"L", "T", "D", "N", "TH", "DH"},
+    "consonant": {
+        "CH", "JH", "SH", "ZH", "S",
+        "Z", "K", "G", "NG", "HH", "R",
+    },
+}
+
+LETTER_GROUPS = {
     "closed_lips": set("BMP"),
     "teeth_lip": set("FV"),
     "rounded": set("OUWQ"),
@@ -35,20 +51,27 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def classify_token(token: str) -> str:
-    token = token.upper()
+def classify_phoneme(phoneme: str) -> str:
+    phoneme = re.sub(r"\d", "", phoneme.upper())
 
-    if token == "|":
-        return "rest"
+    for viseme, phonemes in PHONEME_GROUPS.items():
+        if phoneme in phonemes:
+            return viseme
 
-    for viseme, characters in VISEME_GROUPS.items():
-        if token in characters:
+    return "consonant"
+
+
+def classify_letter(letter: str) -> str:
+    letter = letter.upper()
+
+    for viseme, letters in LETTER_GROUPS.items():
+        if letter in letters:
             return viseme
 
     return "rest"
 
 
-def get_token_segments(
+def extract_ctc_words(
     token_ids: list[int],
     processor: Any,
     duration: float,
@@ -60,8 +83,8 @@ def get_token_segments(
     blank_id = tokenizer.pad_token_id
     delimiter = tokenizer.word_delimiter_token or "|"
 
-    seconds_per_frame = duration / len(token_ids)
-    segments = []
+    frame_duration = duration / len(token_ids)
+    character_segments = []
 
     index = 0
 
@@ -84,28 +107,112 @@ def get_token_segments(
                 if token == delimiter:
                     token = "|"
 
-                if len(token) == 1:
-                    segments.append(
+                if token == "|" or (
+                    len(token) == 1 and token.isalpha()
+                ):
+                    character_segments.append(
                         {
                             "token": token,
-                            "viseme": classify_token(token),
-                            "start": round(
-                                start_index * seconds_per_frame,
-                                3,
-                            ),
-                            "end": round(
-                                min(
-                                    duration,
-                                    end_index * seconds_per_frame,
-                                ),
-                                3,
+                            "start": start_index * frame_duration,
+                            "end": min(
+                                duration,
+                                end_index * frame_duration,
                             ),
                         }
                     )
 
         index += 1
 
-    return segments
+    words = []
+    characters = []
+
+    def finish_word() -> None:
+        if not characters:
+            return
+
+        word = "".join(
+            item["token"] for item in characters
+        )
+
+        words.append(
+            {
+                "word": word,
+                "start": characters[0]["start"],
+                "end": characters[-1]["end"],
+            }
+        )
+
+        characters.clear()
+
+    for item in character_segments:
+        if item["token"] == "|":
+            finish_word()
+        else:
+            characters.append(item)
+
+    finish_word()
+
+    return words
+
+
+def convert_words_to_visemes(
+    words: list[dict],
+) -> tuple[list[dict], int]:
+    segments = []
+    fallback_words = 0
+
+    for entry in words:
+        word = entry["word"].lower()
+        start = float(entry["start"])
+        end = float(entry["end"])
+
+        if end <= start:
+            continue
+
+        pronunciations = PRONUNCIATIONS.get(word)
+
+        if pronunciations:
+            units = [
+                re.sub(r"\d", "", phoneme)
+                for phoneme in pronunciations[0]
+            ]
+            source = "cmudict"
+        else:
+            units = list(word.upper())
+            source = "letter_fallback"
+            fallback_words += 1
+
+        if not units:
+            continue
+
+        step = (end - start) / len(units)
+
+        for index, unit in enumerate(units):
+            unit_start = start + index * step
+            unit_end = start + (index + 1) * step
+
+            viseme = (
+                classify_phoneme(unit)
+                if source == "cmudict"
+                else classify_letter(unit)
+            )
+
+            segments.append(
+                {
+                    "word": entry["word"],
+                    "phoneme": (
+                        unit if source == "cmudict"
+                        else None
+                    ),
+                    "token": unit,
+                    "viseme": viseme,
+                    "start": round(unit_start, 3),
+                    "end": round(unit_end, 3),
+                    "source": source,
+                }
+            )
+
+    return segments, fallback_words
 
 
 def extract_visemes(
@@ -135,12 +242,14 @@ def extract_visemes(
 
     device = get_device()
 
-    processor = Wav2Vec2Processor.from_pretrained(
-        MODEL_NAME
+    processor = cast(
+        Any,
+        Wav2Vec2Processor.from_pretrained(MODEL_NAME),
     )
 
-    model = Wav2Vec2ForCTC.from_pretrained(
-        MODEL_NAME
+    model = cast(
+        Any,
+        Wav2Vec2ForCTC.from_pretrained(MODEL_NAME),
     )
 
     model = model.to(device)
@@ -152,12 +261,10 @@ def extract_visemes(
         return_tensors="pt",
     )
 
-    input_values = inputs.input_values.to(device)
-
     with torch.inference_mode():
-        outputs = model(input_values)
-
-    logits = outputs.logits
+        logits = model(
+            inputs.input_values.to(device)
+        ).logits
 
     predicted_ids = (
         torch.argmax(logits, dim=-1)
@@ -167,13 +274,22 @@ def extract_visemes(
     )
 
     transcription = processor.batch_decode(
-        np.asarray([predicted_ids])
+        [predicted_ids]
     )[0]
 
-    segments = get_token_segments(
+    words = extract_ctc_words(
         predicted_ids,
         processor,
         duration,
+    )
+
+    segments, fallback_words = (
+        convert_words_to_visemes(words)
+    )
+
+    phoneme_segments = sum(
+        segment["source"] == "cmudict"
+        for segment in segments
     )
 
     result = {
@@ -183,8 +299,13 @@ def extract_visemes(
         "model": MODEL_NAME,
         "device": str(device),
         "transcription": transcription,
-        "alignment_type": "ctc_greedy_approximate",
-        "viseme_type": "character_based_approximation",
+        "alignment_type": "ctc_word_approximate",
+        "viseme_type": "phoneme_aware_approximation",
+        "phoneme_timing": "uniform_within_ctc_word",
+        "words": words,
+        "word_count": len(words),
+        "fallback_word_count": fallback_words,
+        "phoneme_segments": phoneme_segments,
         "segments": segments,
     }
 
@@ -238,7 +359,14 @@ def main() -> None:
                 "duration": result["duration"],
                 "device": result["device"],
                 "transcription": result["transcription"],
-                "segments": len(result["segments"]),
+                "word_count": result["word_count"],
+                "phoneme_segments": result["phoneme_segments"],
+                "fallback_words": result[
+                    "fallback_word_count"
+                ],
+                "total_segments": len(
+                    result["segments"]
+                ),
                 "output_file": str(output_path),
             },
             indent=2,

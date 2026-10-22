@@ -9,40 +9,192 @@ import numpy as np
 FPS = 30
 
 VISEME_VALUES = {
-    "rest": (0.0, 0.0),
-    "closed_lips": (0.02, 0.15),
-    "teeth_lip": (0.16, 0.35),
-    "rounded": (0.42, 0.2),
-    "wide": (0.38, 0.85),
-    "open": (0.9, 0.55),
-    "tongue": (0.25, 0.45),
-    "consonant": (0.18, 0.4),
+    "rest": (0.02, 0.15),
+    "closed_lips": (0.0, 0.12),
+    "teeth_lip": (0.12, 0.32),
+    "rounded": (0.38, 0.22),
+    "wide": (0.34, 0.70),
+    "open": (0.72, 0.48),
+    "tongue": (0.22, 0.40),
+    "consonant": (0.18, 0.35),
 }
 
+MIN_TRANSITION_SECONDS = 0.09
+ATTACK_SECONDS = 0.075
+RELEASE_SECONDS = 0.11
+MAX_CHANGE_PER_SECOND = 1.8
+VISEME_STRENGTH = 0.62
 
-def smooth_signal(
-    values: np.ndarray,
-    window: int = 5,
-) -> np.ndarray:
-    if window <= 1:
-        return values.copy()
 
-    kernel = np.ones(window, dtype=np.float32)
-    kernel /= kernel.sum()
-
-    padding = window // 2
-
-    padded = np.pad(
+def clamp_signal(values: np.ndarray) -> np.ndarray:
+    return np.clip(
         values,
-        (padding, padding),
-        mode="edge",
+        0.0,
+        1.0,
     )
 
-    return np.convolve(
-        padded,
-        kernel,
-        mode="valid",
+
+def smooth_transition(
+    values: np.ndarray,
+    attack_seconds: float,
+    release_seconds: float,
+    fps: int,
+) -> np.ndarray:
+    result = np.zeros_like(
+        values,
+        dtype=np.float64,
     )
+
+    if len(values) == 0:
+        return result
+
+    result[0] = values[0]
+
+    attack_alpha = 1.0 - np.exp(
+        -1.0 / (fps * attack_seconds)
+    )
+
+    release_alpha = 1.0 - np.exp(
+        -1.0 / (fps * release_seconds)
+    )
+
+    for index in range(1, len(values)):
+        previous = result[index - 1]
+        target = values[index]
+
+        alpha = (
+            attack_alpha
+            if target > previous
+            else release_alpha
+        )
+
+        result[index] = (
+            previous + alpha * (target - previous)
+        )
+
+    return result
+
+
+def limit_motion_speed(
+    values: np.ndarray,
+    max_change_per_second: float,
+    fps: int,
+) -> np.ndarray:
+    result = values.copy()
+
+    maximum_step = max_change_per_second / fps
+
+    for index in range(1, len(result)):
+        difference = (
+            result[index] - result[index - 1]
+        )
+
+        difference = np.clip(
+            difference,
+            -maximum_step,
+            maximum_step,
+        )
+
+        result[index] = (
+            result[index - 1] + difference
+        )
+
+    return result
+
+
+def build_viseme_targets(
+    segments: list[dict],
+    frame_count: int,
+    fps: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    times = np.arange(
+        frame_count,
+        dtype=np.float64,
+    ) / fps
+
+    opening_sum = np.zeros(
+        frame_count,
+        dtype=np.float64,
+    )
+
+    width_sum = np.zeros(
+        frame_count,
+        dtype=np.float64,
+    )
+
+    weights = np.zeros(
+        frame_count,
+        dtype=np.float64,
+    )
+
+    for segment in segments:
+        category = segment.get("viseme", "rest")
+
+        if category not in VISEME_VALUES:
+            continue
+
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if (
+            not np.isfinite(start)
+            or not np.isfinite(end)
+            or end <= start
+        ):
+            continue
+
+        center = (start + end) / 2
+
+        duration = max(
+            end - start,
+            MIN_TRANSITION_SECONDS,
+        )
+
+        half_width = duration / 2
+
+        distance = np.abs(times - center)
+
+        influence = np.maximum(
+            0.0,
+            1.0 - distance / half_width,
+        )
+
+        opening, width = VISEME_VALUES[category]
+
+        opening_sum += influence * opening
+        width_sum += influence * width
+        weights += influence
+
+    target_open = np.zeros(
+        frame_count,
+        dtype=np.float64,
+    )
+
+    target_width = np.zeros(
+        frame_count,
+        dtype=np.float64,
+    )
+
+    active = weights > 1e-8
+
+    target_open[active] = (
+        opening_sum[active] / weights[active]
+    )
+
+    target_width[active] = (
+        width_sum[active] / weights[active]
+    )
+
+    confidence = np.clip(
+        weights,
+        0.0,
+        1.0,
+    )
+
+    return target_open, target_width, confidence
 
 
 def generate_viseme_motion(
@@ -50,14 +202,28 @@ def generate_viseme_motion(
     viseme_path: Path,
     output_path: Path,
 ) -> dict:
+    if not baseline_path.is_file():
+        raise FileNotFoundError(
+            f"Baseline not found: {baseline_path}"
+        )
+
+    if not viseme_path.is_file():
+        raise FileNotFoundError(
+            f"Viseme file not found: {viseme_path}"
+        )
+
     baseline = np.load(
         baseline_path,
         allow_pickle=False,
     )
 
-    if baseline.ndim != 2 or baseline.shape[1] != 7:
+    if (
+        baseline.ndim != 2
+        or baseline.shape[1] != 7
+        or baseline.shape[0] == 0
+    ):
         raise ValueError(
-            "Baseline motion must have 7 dimensions"
+            "Baseline motion must have 7 channels"
         )
 
     if not np.isfinite(baseline).all():
@@ -71,145 +237,127 @@ def generate_viseme_motion(
 
     segments = viseme_data.get("segments", [])
 
+    if not isinstance(segments, list):
+        raise ValueError(
+            "Viseme segments must be a list"
+        )
+
     frame_count = baseline.shape[0]
 
     motion = baseline.astype(
-        np.float32,
+        np.float64,
         copy=True,
     )
 
-    mouth_open = np.zeros(
-        frame_count,
-        dtype=np.float32,
-    )
-
-    mouth_width = np.zeros(
-        frame_count,
-        dtype=np.float32,
-    )
-
-    weights = np.zeros(
-        frame_count,
-        dtype=np.float32,
-    )
-
-    times = np.arange(
-        frame_count,
-        dtype=np.float32,
-    ) / FPS
-
-    for segment in segments:
-        category = segment.get("viseme", "rest")
-
-        if category not in VISEME_VALUES:
-            continue
-
-        start = float(segment["start"])
-        end = float(segment["end"])
-
-        if end <= start:
-            continue
-
-        open_value, width_value = VISEME_VALUES[
-            category
-        ]
-
-        center = (start + end) / 2
-
-        spread = max(
-            0.055,
-            (end - start) / 2,
+    target_open, target_width, confidence = (
+        build_viseme_targets(
+            segments,
+            frame_count,
+            FPS,
         )
-
-        influence = np.exp(
-            -0.5 * ((times - center) / spread) ** 2
-        ).astype(np.float32)
-
-        mouth_open += influence * open_value
-        mouth_width += influence * width_value
-        weights += influence
-
-    active = weights > 0.01
-
-    target_open = np.zeros(
-        frame_count,
-        dtype=np.float32,
     )
 
-    target_width = np.zeros(
-        frame_count,
-        dtype=np.float32,
+    baseline_open = clamp_signal(
+        motion[:, 0]
     )
 
-    target_open[active] = (
-        mouth_open[active] / weights[active]
+    baseline_width = clamp_signal(
+        motion[:, 1]
     )
 
-    target_width[active] = (
-        mouth_width[active] / weights[active]
+    blend = confidence * VISEME_STRENGTH
+
+    combined_open = (
+        (1.0 - blend) * baseline_open
+        + blend * target_open
     )
 
-    baseline_open = np.clip(
-        baseline[:, 0],
-        0,
-        1,
+    combined_width = (
+        (1.0 - blend) * baseline_width
+        + blend * target_width
     )
 
-    baseline_width = np.clip(
-        baseline[:, 1],
-        0,
-        1,
+    smooth_open = smooth_transition(
+        combined_open,
+        ATTACK_SECONDS,
+        RELEASE_SECONDS,
+        FPS,
     )
 
-    confidence = np.clip(
-        weights,
-        0,
-        1,
+    smooth_width = smooth_transition(
+        combined_width,
+        ATTACK_SECONDS,
+        RELEASE_SECONDS,
+        FPS,
     )
 
-    blended_open = (
-        (1 - confidence) * baseline_open
-        + confidence * target_open
+    smooth_open = limit_motion_speed(
+        smooth_open,
+        MAX_CHANGE_PER_SECOND,
+        FPS,
     )
 
-    blended_width = (
-        (1 - confidence) * baseline_width
-        + confidence * target_width
+    smooth_width = limit_motion_speed(
+        smooth_width,
+        MAX_CHANGE_PER_SECOND,
+        FPS,
     )
 
-    motion[:, 0] = np.clip(
-        smooth_signal(blended_open),
-        0,
-        1,
-    )
+    motion[:, 0] = clamp_signal(smooth_open)
+    motion[:, 1] = clamp_signal(smooth_width)
 
-    motion[:, 1] = np.clip(
-        smooth_signal(blended_width),
-        0,
-        1,
-    )
+    output = motion.astype(np.float32)
 
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    np.save(output_path, motion)
+    np.save(output_path, output)
+
+    frame_changes = np.abs(
+        np.diff(output[:, 0])
+    )
 
     return {
         "output_file": str(output_path),
-        "frames": int(motion.shape[0]),
+        "frames": int(frame_count),
         "fps": FPS,
-        "dimensions": int(motion.shape[1]),
+        "dimensions": int(output.shape[1]),
         "viseme_segments": len(segments),
-        "duration": round(frame_count / FPS, 2),
+        "duration": round(frame_count / FPS, 3),
         "mouth_open_min": round(
-            float(motion[:, 0].min()),
+            float(output[:, 0].min()),
             4,
         ),
         "mouth_open_max": round(
-            float(motion[:, 0].max()),
+            float(output[:, 0].max()),
             4,
+        ),
+        "mean_frame_change": round(
+            float(frame_changes.mean())
+            if frame_changes.size
+            else 0.0,
+            5,
+        ),
+        "max_frame_change": round(
+            float(frame_changes.max())
+            if frame_changes.size
+            else 0.0,
+            5,
+        ),
+        "smoothing": {
+            "transition_seconds": MIN_TRANSITION_SECONDS,
+            "attack_seconds": ATTACK_SECONDS,
+            "release_seconds": RELEASE_SECONDS,
+            "max_change_per_second": MAX_CHANGE_PER_SECOND,
+            "viseme_strength": VISEME_STRENGTH,
+        },
+        "other_parameters_preserved": bool(
+            np.array_equal(
+                baseline[:, 2:],
+                output[:, 2:],
+            )
         ),
     }
 

@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import cmudict
 import librosa
+import numpy as np
 import torch
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
@@ -40,6 +41,25 @@ LETTER_GROUPS = {
     "consonant": set("CGHJKRSXZ"),
 }
 
+VOWEL_PHONEMES = {
+    "AA", "AE", "AH", "AO", "AW", "AY",
+    "EH", "ER", "EY", "IH", "IY",
+    "OW", "OY", "UH", "UW",
+}
+
+STOP_PHONEMES = {
+    "P", "B", "T", "D", "K", "G",
+}
+
+NASAL_PHONEMES = {
+    "M", "N", "NG",
+}
+
+FRICATIVE_PHONEMES = {
+    "F", "V", "TH", "DH", "S",
+    "Z", "SH", "ZH", "HH",
+}
+
 
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -51,8 +71,12 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def normalize_phoneme(phoneme: str) -> str:
+    return re.sub(r"\d", "", phoneme.upper())
+
+
 def classify_phoneme(phoneme: str) -> str:
-    phoneme = re.sub(r"\d", "", phoneme.upper())
+    phoneme = normalize_phoneme(phoneme)
 
     for viseme, phonemes in PHONEME_GROUPS.items():
         if phoneme in phonemes:
@@ -71,6 +95,34 @@ def classify_letter(letter: str) -> str:
     return "rest"
 
 
+def get_phoneme_weight(phoneme: str) -> float:
+    phoneme = normalize_phoneme(phoneme)
+
+    if phoneme in VOWEL_PHONEMES:
+        return 1.65
+
+    if phoneme in STOP_PHONEMES:
+        return 0.65
+
+    if phoneme in NASAL_PHONEMES:
+        return 1.05
+
+    if phoneme in FRICATIVE_PHONEMES:
+        return 1.15
+
+    if phoneme in {"L", "R", "W", "Y"}:
+        return 1.2
+
+    return 1.0
+
+
+def get_letter_weight(letter: str) -> float:
+    if letter.upper() in "AEIOUY":
+        return 1.4
+
+    return 1.0
+
+
 def extract_ctc_words(
     token_ids: list[int],
     processor: Any,
@@ -84,8 +136,8 @@ def extract_ctc_words(
     delimiter = tokenizer.word_delimiter_token or "|"
 
     frame_duration = duration / len(token_ids)
-    character_segments = []
 
+    character_segments = []
     index = 0
 
     while index < len(token_ids):
@@ -101,19 +153,23 @@ def extract_ctc_words(
         end_index = index + 1
 
         if token_id != blank_id:
-            token = tokenizer.convert_ids_to_tokens(token_id)
+            token = tokenizer.convert_ids_to_tokens(
+                int(token_id)
+            )
 
             if isinstance(token, str):
                 if token == delimiter:
                     token = "|"
 
                 if token == "|" or (
-                    len(token) == 1 and token.isalpha()
+                    len(token) == 1
+                    and token.isalpha()
                 ):
                     character_segments.append(
                         {
                             "token": token,
-                            "start": start_index * frame_duration,
+                            "start": start_index
+                            * frame_duration,
                             "end": min(
                                 duration,
                                 end_index * frame_duration,
@@ -131,16 +187,21 @@ def extract_ctc_words(
             return
 
         word = "".join(
-            item["token"] for item in characters
+            item["token"]
+            for item in characters
         )
 
-        words.append(
-            {
-                "word": word,
-                "start": characters[0]["start"],
-                "end": characters[-1]["end"],
-            }
-        )
+        start = float(characters[0]["start"])
+        end = float(characters[-1]["end"])
+
+        if word and end > start:
+            words.append(
+                {
+                    "word": word,
+                    "start": start,
+                    "end": end,
+                }
+            )
 
         characters.clear()
 
@@ -155,6 +216,73 @@ def extract_ctc_words(
     return words
 
 
+def allocate_phoneme_intervals(
+    units: list[str],
+    start: float,
+    end: float,
+    source: str,
+) -> list[tuple[str, float, float]]:
+    if not units or end <= start:
+        return []
+
+    if source == "cmudict":
+        weights = np.asarray(
+            [
+                get_phoneme_weight(unit)
+                for unit in units
+            ],
+            dtype=np.float64,
+        )
+    else:
+        weights = np.asarray(
+            [
+                get_letter_weight(unit)
+                for unit in units
+            ],
+            dtype=np.float64,
+        )
+
+    total_weight = float(weights.sum())
+
+    if total_weight <= 0:
+        return []
+
+    durations = (
+        weights / total_weight
+    ) * (end - start)
+
+    boundaries = np.concatenate(
+        (
+            np.asarray([start]),
+            start + np.cumsum(durations),
+        )
+    )
+
+    boundaries[-1] = end
+
+    intervals = []
+
+    for index, unit in enumerate(units):
+        interval_start = float(
+            boundaries[index]
+        )
+
+        interval_end = float(
+            boundaries[index + 1]
+        )
+
+        if interval_end > interval_start:
+            intervals.append(
+                (
+                    unit,
+                    interval_start,
+                    interval_end,
+                )
+            )
+
+    return intervals
+
+
 def convert_words_to_visemes(
     words: list[dict],
 ) -> tuple[list[dict], int]:
@@ -162,35 +290,39 @@ def convert_words_to_visemes(
     fallback_words = 0
 
     for entry in words:
-        word = entry["word"].lower()
+        word = str(entry["word"]).lower()
         start = float(entry["start"])
         end = float(entry["end"])
 
-        if end <= start:
+        if (
+            not np.isfinite(start)
+            or not np.isfinite(end)
+            or end <= start
+        ):
             continue
 
         pronunciations = PRONUNCIATIONS.get(word)
 
         if pronunciations:
             units = [
-                re.sub(r"\d", "", phoneme)
+                normalize_phoneme(phoneme)
                 for phoneme in pronunciations[0]
             ]
+
             source = "cmudict"
         else:
             units = list(word.upper())
             source = "letter_fallback"
             fallback_words += 1
 
-        if not units:
-            continue
+        intervals = allocate_phoneme_intervals(
+            units,
+            start,
+            end,
+            source,
+        )
 
-        step = (end - start) / len(units)
-
-        for index, unit in enumerate(units):
-            unit_start = start + index * step
-            unit_end = start + (index + 1) * step
-
+        for unit, unit_start, unit_end in intervals:
             viseme = (
                 classify_phoneme(unit)
                 if source == "cmudict"
@@ -201,18 +333,71 @@ def convert_words_to_visemes(
                 {
                     "word": entry["word"],
                     "phoneme": (
-                        unit if source == "cmudict"
+                        unit
+                        if source == "cmudict"
                         else None
                     ),
                     "token": unit,
                     "viseme": viseme,
-                    "start": round(unit_start, 3),
-                    "end": round(unit_end, 3),
+                    "start": round(unit_start, 4),
+                    "end": round(unit_end, 4),
                     "source": source,
                 }
             )
 
+    segments.sort(
+        key=lambda segment: (
+            segment["start"],
+            segment["end"],
+        )
+    )
+
     return segments, fallback_words
+
+
+def get_speech_pauses(
+    words: list[dict],
+    duration: float,
+    minimum_pause: float = 0.08,
+) -> list[dict]:
+    pauses = []
+    previous_end = 0.0
+
+    for word in words:
+        start = float(word["start"])
+        end = float(word["end"])
+
+        if start - previous_end >= minimum_pause:
+            pauses.append(
+                {
+                    "start": round(
+                        previous_end,
+                        4,
+                    ),
+                    "end": round(start, 4),
+                }
+            )
+
+        previous_end = max(
+            previous_end,
+            end,
+        )
+
+    if duration - previous_end >= minimum_pause:
+        pauses.append(
+            {
+                "start": round(
+                    previous_end,
+                    4,
+                ),
+                "end": round(
+                    duration,
+                    4,
+                ),
+            }
+        )
+
+    return pauses
 
 
 def extract_visemes(
@@ -244,12 +429,16 @@ def extract_visemes(
 
     processor = cast(
         Any,
-        Wav2Vec2Processor.from_pretrained(MODEL_NAME),
+        Wav2Vec2Processor.from_pretrained(
+            MODEL_NAME
+        ),
     )
 
     model = cast(
         Any,
-        Wav2Vec2ForCTC.from_pretrained(MODEL_NAME),
+        Wav2Vec2ForCTC.from_pretrained(
+            MODEL_NAME
+        ),
     )
 
     model = model.to(device)
@@ -287,6 +476,11 @@ def extract_visemes(
         convert_words_to_visemes(words)
     )
 
+    pauses = get_speech_pauses(
+        words,
+        duration,
+    )
+
     phoneme_segments = sum(
         segment["source"] == "cmudict"
         for segment in segments
@@ -294,18 +488,20 @@ def extract_visemes(
 
     result = {
         "audio_file": audio_path.name,
-        "duration": round(duration, 3),
+        "duration": round(duration, 4),
         "sample_rate": sample_rate,
         "model": MODEL_NAME,
         "device": str(device),
         "transcription": transcription,
         "alignment_type": "ctc_word_approximate",
-        "viseme_type": "phoneme_aware_approximation",
-        "phoneme_timing": "uniform_within_ctc_word",
+        "viseme_type": "duration_weighted_phoneme_approximation",
+        "phoneme_timing": "weighted_within_ctc_word",
         "words": words,
         "word_count": len(words),
         "fallback_word_count": fallback_words,
         "phoneme_segments": phoneme_segments,
+        "pauses": pauses,
+        "pause_count": len(pauses),
         "segments": segments,
     }
 
@@ -315,7 +511,10 @@ def extract_visemes(
     )
 
     output_path.write_text(
-        json.dumps(result, indent=2),
+        json.dumps(
+            result,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -360,10 +559,13 @@ def main() -> None:
                 "device": result["device"],
                 "transcription": result["transcription"],
                 "word_count": result["word_count"],
-                "phoneme_segments": result["phoneme_segments"],
+                "phoneme_segments": result[
+                    "phoneme_segments"
+                ],
                 "fallback_words": result[
                     "fallback_word_count"
                 ],
+                "pause_count": result["pause_count"],
                 "total_segments": len(
                     result["segments"]
                 ),

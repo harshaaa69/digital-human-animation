@@ -20,18 +20,19 @@ VISEME_VALUES = {
 }
 
 MIN_TRANSITION_SECONDS = 0.09
-ATTACK_SECONDS = 0.075
-RELEASE_SECONDS = 0.11
-MAX_CHANGE_PER_SECOND = 1.8
-VISEME_STRENGTH = 0.62
+ATTACK_SECONDS = 0.065
+RELEASE_SECONDS = 0.10
+MAX_CHANGE_PER_SECOND = 1.5
+VISEME_STRENGTH = 0.65
+
+MIN_PAUSE_DURATION = 0.18
+PAUSE_FADE_SECONDS = 0.08
+PAUSE_MOUTH_OPEN = 0.015
+PAUSE_MOUTH_WIDTH = 0.12
 
 
 def clamp_signal(values: np.ndarray) -> np.ndarray:
-    return np.clip(
-        values,
-        0.0,
-        1.0,
-    )
+    return np.clip(values, 0.0, 1.0)
 
 
 def smooth_transition(
@@ -153,13 +154,14 @@ def build_viseme_targets(
             MIN_TRANSITION_SECONDS,
         )
 
-        half_width = duration / 2
+        spread = max(
+            0.045,
+            duration * 0.65,
+        )
 
-        distance = np.abs(times - center)
-
-        influence = np.maximum(
-            0.0,
-            1.0 - distance / half_width,
+        influence = np.exp(
+            -0.5
+            * ((times - center) / spread) ** 2
         )
 
         opening, width = VISEME_VALUES[category]
@@ -197,6 +199,89 @@ def build_viseme_targets(
     return target_open, target_width, confidence
 
 
+def build_pause_envelope(
+    pauses: list[dict],
+    frame_count: int,
+    fps: int,
+) -> tuple[np.ndarray, int]:
+    times = np.arange(
+        frame_count,
+        dtype=np.float64,
+    ) / fps
+
+    envelope = np.zeros(
+        frame_count,
+        dtype=np.float64,
+    )
+
+    applied_pauses = 0
+
+    for pause in pauses:
+        try:
+            start = float(pause["start"])
+            end = float(pause["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if (
+            not np.isfinite(start)
+            or not np.isfinite(end)
+            or end - start < MIN_PAUSE_DURATION
+        ):
+            continue
+
+        duration = end - start
+
+        fade = min(
+            PAUSE_FADE_SECONDS,
+            duration * 0.3,
+        )
+
+        if fade <= 0:
+            continue
+
+        fade_in = np.clip(
+            (times - start) / fade,
+            0.0,
+            1.0,
+        )
+
+        fade_out = np.clip(
+            (end - times) / fade,
+            0.0,
+            1.0,
+        )
+
+        shape = np.minimum(
+            fade_in,
+            fade_out,
+        )
+
+        shape = (
+            shape * shape * (3.0 - 2.0 * shape)
+        )
+
+        inside = (
+            (times >= start)
+            & (times <= end)
+        )
+
+        shape = np.where(
+            inside,
+            shape,
+            0.0,
+        )
+
+        envelope = np.maximum(
+            envelope,
+            shape,
+        )
+
+        applied_pauses += 1
+
+    return envelope, applied_pauses
+
+
 def generate_viseme_motion(
     baseline_path: Path,
     viseme_path: Path,
@@ -212,6 +297,11 @@ def generate_viseme_motion(
             f"Viseme file not found: {viseme_path}"
         )
 
+    if baseline_path.resolve() == output_path.resolve():
+        raise ValueError(
+            "Output cannot overwrite baseline motion"
+        )
+
     baseline = np.load(
         baseline_path,
         allow_pickle=False,
@@ -223,7 +313,7 @@ def generate_viseme_motion(
         or baseline.shape[0] == 0
     ):
         raise ValueError(
-            "Baseline motion must have 7 channels"
+            "Baseline motion must contain seven channels"
         )
 
     if not np.isfinite(baseline).all():
@@ -236,10 +326,16 @@ def generate_viseme_motion(
     )
 
     segments = viseme_data.get("segments", [])
+    pauses = viseme_data.get("pauses", [])
 
     if not isinstance(segments, list):
         raise ValueError(
             "Viseme segments must be a list"
+        )
+
+    if not isinstance(pauses, list):
+        raise ValueError(
+            "Speech pauses must be a list"
         )
 
     frame_count = baseline.shape[0]
@@ -252,6 +348,14 @@ def generate_viseme_motion(
     target_open, target_width, confidence = (
         build_viseme_targets(
             segments,
+            frame_count,
+            FPS,
+        )
+    )
+
+    pause_envelope, applied_pauses = (
+        build_pause_envelope(
+            pauses,
             frame_count,
             FPS,
         )
@@ -275,6 +379,16 @@ def generate_viseme_motion(
     combined_width = (
         (1.0 - blend) * baseline_width
         + blend * target_width
+    )
+
+    combined_open = (
+        (1.0 - pause_envelope) * combined_open
+        + pause_envelope * PAUSE_MOUTH_OPEN
+    )
+
+    combined_width = (
+        (1.0 - pause_envelope) * combined_width
+        + pause_envelope * PAUSE_MOUTH_WIDTH
     )
 
     smooth_open = smooth_transition(
@@ -324,8 +438,13 @@ def generate_viseme_motion(
         "frames": int(frame_count),
         "fps": FPS,
         "dimensions": int(output.shape[1]),
+        "duration": round(
+            frame_count / FPS,
+            3,
+        ),
         "viseme_segments": len(segments),
-        "duration": round(frame_count / FPS, 3),
+        "detected_pauses": len(pauses),
+        "applied_pauses": applied_pauses,
         "mouth_open_min": round(
             float(output[:, 0].min()),
             4,
@@ -346,19 +465,20 @@ def generate_viseme_motion(
             else 0.0,
             5,
         ),
-        "smoothing": {
-            "transition_seconds": MIN_TRANSITION_SECONDS,
-            "attack_seconds": ATTACK_SECONDS,
-            "release_seconds": RELEASE_SECONDS,
-            "max_change_per_second": MAX_CHANGE_PER_SECOND,
-            "viseme_strength": VISEME_STRENGTH,
-        },
         "other_parameters_preserved": bool(
             np.array_equal(
                 baseline[:, 2:],
                 output[:, 2:],
             )
         ),
+        "smoothing": {
+            "attack_seconds": ATTACK_SECONDS,
+            "release_seconds": RELEASE_SECONDS,
+            "max_change_per_second": MAX_CHANGE_PER_SECOND,
+            "viseme_strength": VISEME_STRENGTH,
+            "minimum_pause_seconds": MIN_PAUSE_DURATION,
+            "pause_fade_seconds": PAUSE_FADE_SECONDS,
+        },
     }
 
 

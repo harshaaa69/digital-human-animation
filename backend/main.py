@@ -13,12 +13,16 @@ from backend.audio_utils import (
     get_audio_metadata,
 )
 from backend.motion_generator import generate_motion
+from backend.motion_smoothing import generate_smoothed_motion
 from backend.speech_features import extract_speech_features
+from backend.speech_visemes import extract_visemes
 from backend.video_export import export_mp4
+from backend.viseme_motion import generate_viseme_motion
+
 
 app = FastAPI(
     title="Digital Human Animation API",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -39,6 +43,7 @@ PROCESSED_DIR = BASE_DIR / "data" / "processed"
 FEATURE_DIR = BASE_DIR / "data" / "features"
 TEST_SEGMENT_DIR = BASE_DIR / "data" / "test_segments"
 MOTION_DIR = BASE_DIR / "data" / "motion"
+VISEME_DIR = BASE_DIR / "data" / "visemes"
 OUTPUT_DIR = BASE_DIR / "outputs"
 TEMP_VIDEO_DIR = OUTPUT_DIR / "temporary"
 
@@ -48,6 +53,7 @@ for directory in [
     FEATURE_DIR,
     TEST_SEGMENT_DIR,
     MOTION_DIR,
+    VISEME_DIR,
     OUTPUT_DIR,
     TEMP_VIDEO_DIR,
 ]:
@@ -55,15 +61,27 @@ for directory in [
 
 ALLOWED_AUDIO_TYPES = {
     "audio/mpeg",
+    "audio/mp3",
     "audio/wav",
     "audio/x-wav",
+    "audio/wave",
     "audio/mp4",
     "audio/x-m4a",
     "audio/aac",
+    "application/octet-stream",
+}
+
+ALLOWED_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".aac",
 }
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MAX_RECORDING_SIZE = 150 * 1024 * 1024
+PROCESSING_DURATION = 15
+FPS = 30
 
 MOTION_PARAMETERS = [
     "mouth_open",
@@ -92,6 +110,28 @@ def validate_filename(filename: str, suffix: str) -> str:
     return filename
 
 
+def motion_response(path: Path) -> dict:
+    motion = np.load(path, allow_pickle=False)
+
+    if (
+        motion.ndim != 2
+        or motion.shape[1] != len(MOTION_PARAMETERS)
+        or motion.shape[0] == 0
+    ):
+        raise ValueError("Unexpected motion data shape")
+
+    if not np.isfinite(motion).all():
+        raise ValueError("Motion data contains invalid values")
+
+    return {
+        "motion_name": path.name,
+        "fps": FPS,
+        "frames": int(motion.shape[0]),
+        "parameters": MOTION_PARAMETERS,
+        "data": motion.tolist(),
+    }
+
+
 @app.get("/")
 def root():
     return {
@@ -106,6 +146,15 @@ def health():
 
 @app.post("/upload-audio")
 async def upload_audio(file: UploadFile = File(...)):
+    original_name = Path(file.filename or "").name
+    extension = Path(original_name).suffix.lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file extension",
+        )
+
     if file.content_type not in ALLOWED_AUDIO_TYPES:
         raise HTTPException(
             status_code=400,
@@ -116,22 +165,14 @@ async def upload_audio(file: UploadFile = File(...)):
 
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
-            status_code=400,
-            detail="Audio file must be smaller than 25 MB",
+            status_code=413,
+            detail="Audio file must not exceed 25 MB",
         )
 
-    original_name = Path(file.filename or "audio").name
-    extension = Path(original_name).suffix.lower()
-
-    if extension not in {
-        ".mp3",
-        ".wav",
-        ".m4a",
-        ".aac",
-    }:
+    if not content:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file extension",
+            detail="Audio file is empty",
         )
 
     unique_id = uuid4().hex
@@ -152,14 +193,17 @@ async def upload_audio(file: UploadFile = File(...)):
 
         metadata = get_audio_metadata(processed_path)
 
-    except Exception:
+    except Exception as error:
         uploaded_path.unlink(missing_ok=True)
         processed_path.unlink(missing_ok=True)
 
         raise HTTPException(
-            status_code=500,
-            detail="Audio preprocessing failed",
+            status_code=422,
+            detail=f"Audio preprocessing failed: {error}",
         )
+
+    finally:
+        await file.close()
 
     return {
         "message": "Audio uploaded and processed successfully",
@@ -183,14 +227,16 @@ def create_short_test_segment(processed_name: str):
             detail="Processed audio file not found",
         )
 
-    segment_name = f"{processed_path.stem}_15s.wav"
+    segment_name = (
+        f"{processed_path.stem}_{PROCESSING_DURATION}s.wav"
+    )
     segment_path = TEST_SEGMENT_DIR / segment_name
 
     try:
         create_test_segment(
             processed_path,
             segment_path,
-            duration_seconds=15,
+            duration_seconds=PROCESSING_DURATION,
         )
 
         metadata = get_audio_metadata(segment_path)
@@ -274,6 +320,149 @@ def generate_motion_data(segment_name: str):
     }
 
 
+@app.post("/process-audio/{processed_name}")
+def process_audio(processed_name: str):
+    safe_name = validate_filename(processed_name, ".wav")
+    processed_path = PROCESSED_DIR / safe_name
+
+    if not processed_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Processed audio file not found",
+        )
+
+    stem = f"{processed_path.stem}_{PROCESSING_DURATION}s"
+
+    segment_path = TEST_SEGMENT_DIR / f"{stem}.wav"
+    feature_path = FEATURE_DIR / f"{stem}_features.npy"
+    viseme_path = VISEME_DIR / f"{stem}_visemes.json"
+
+    baseline_path = MOTION_DIR / f"{stem}_motion.npy"
+    enhanced_path = MOTION_DIR / f"{stem}_viseme_motion.npy"
+    smoothed_path = MOTION_DIR / f"{stem}_smoothed_motion.npy"
+
+    generated_paths = [
+        segment_path,
+        feature_path,
+        viseme_path,
+        baseline_path,
+        enhanced_path,
+        smoothed_path,
+    ]
+
+    try:
+        create_test_segment(
+            processed_path,
+            segment_path,
+            duration_seconds=PROCESSING_DURATION,
+        )
+
+        audio_metadata = get_audio_metadata(segment_path)
+
+        baseline_result = generate_motion(
+            segment_path,
+            baseline_path,
+        )
+
+        feature_result = extract_speech_features(
+            segment_path,
+            feature_path,
+        )
+
+        viseme_result = extract_visemes(
+            segment_path,
+            viseme_path,
+        )
+
+        enhanced_result = generate_viseme_motion(
+            baseline_path,
+            viseme_path,
+            enhanced_path,
+        )
+
+        smoothing_result = generate_smoothed_motion(
+            enhanced_path,
+            smoothed_path,
+        )
+
+        baseline = np.load(
+            baseline_path,
+            allow_pickle=False,
+        )
+
+        enhanced = np.load(
+            enhanced_path,
+            allow_pickle=False,
+        )
+
+        smoothed = np.load(
+            smoothed_path,
+            allow_pickle=False,
+        )
+
+        if (
+            baseline.ndim != 2
+            or baseline.shape[1] != 7
+            or baseline.shape != enhanced.shape
+            or baseline.shape != smoothed.shape
+            or not np.isfinite(baseline).all()
+            or not np.isfinite(enhanced).all()
+            or not np.isfinite(smoothed).all()
+        ):
+            raise ValueError(
+                "Generated motion sequences are inconsistent"
+            )
+
+    except Exception as error:
+        for path in generated_paths:
+            path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Audio processing failed: {error}",
+        )
+
+    return {
+        "message": "Audio animation processing completed",
+        "processed_name": safe_name,
+        "audio_name": segment_path.name,
+        "audio_url": f"/test-audio/{segment_path.name}",
+        "audio_metadata": audio_metadata,
+        "fps": FPS,
+        "frames": int(baseline.shape[0]),
+        "duration": round(
+            baseline.shape[0] / FPS,
+            3,
+        ),
+        "motion_files": {
+            "baseline": baseline_path.name,
+            "viseme": enhanced_path.name,
+            "smoothed": smoothed_path.name,
+        },
+        "motion_urls": {
+            "baseline": f"/motion-data/{baseline_path.name}",
+            "viseme": f"/motion-data/{enhanced_path.name}",
+            "smoothed": f"/motion-data/{smoothed_path.name}",
+        },
+        "feature_file": feature_path.name,
+        "viseme_file": viseme_path.name,
+        "transcription": viseme_result["transcription"],
+        "viseme_segments": len(
+            viseme_result["segments"]
+        ),
+        "processing_details": {
+            "baseline": baseline_result,
+            "features": feature_result,
+            "enhanced": enhanced_result,
+            "smoothing": smoothing_result,
+        },
+        "note": (
+            "Viseme mapping is an experimental "
+            "character-based approximation."
+        ),
+    }
+
+
 @app.get("/motion-data/{motion_name}")
 def get_motion_data(motion_name: str):
     safe_name = validate_filename(motion_name, ".npy")
@@ -286,30 +475,13 @@ def get_motion_data(motion_name: str):
         )
 
     try:
-        motion = np.load(
-            motion_path,
-            allow_pickle=False,
-        )
-
-        if motion.ndim != 2 or motion.shape[1] != 7:
-            raise ValueError("Unexpected motion data shape")
-
-        if not np.isfinite(motion).all():
-            raise ValueError("Motion data contains invalid values")
+        return motion_response(motion_path)
 
     except (ValueError, OSError) as error:
         raise HTTPException(
             status_code=500,
             detail=f"Unable to load motion data: {error}",
         )
-
-    return {
-        "motion_name": safe_name,
-        "fps": 30,
-        "frames": int(motion.shape[0]),
-        "parameters": MOTION_PARAMETERS,
-        "data": motion.tolist(),
-    }
 
 
 @app.get("/test-audio/{segment_name}")
@@ -356,7 +528,11 @@ async def create_video(
     video_path = OUTPUT_DIR / video_name
 
     try:
-        if recording.content_type not in {
+        recording_type = (
+            recording.content_type or ""
+        ).split(";")[0].strip().lower()
+
+        if recording_type not in {
             "video/webm",
             "application/octet-stream",
         }:
@@ -392,6 +568,7 @@ async def create_video(
         )
 
     except HTTPException:
+        video_path.unlink(missing_ok=True)
         raise
 
     except (
